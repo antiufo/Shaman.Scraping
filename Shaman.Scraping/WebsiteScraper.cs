@@ -174,8 +174,19 @@ namespace Shaman.Scraping
 
         private SynchronizationContext syncCtx;
         private int threadId;
+        private static bool curlInitialized;
         public WebsiteScraper()
         {
+        
+            lock(typeof(WebsiteScraper))
+            {
+                if (!curlInitialized)
+                {
+                    Curl.GlobalInit(CurlInitFlag.All);
+                    curlInitialized = true;
+                }
+            }
+        
             syncCtx = SynchronizationContext.Current;
             threadId = Environment.CurrentManagedThreadId;
             if (syncCtx == null) throw new InvalidOperationException("The object must be used within a SynchronizationContext.");
@@ -1817,11 +1828,6 @@ namespace Shaman.Scraping
 
 
 #if WARC
-
-        static WebsiteScraper()
-        {
-            Curl.GlobalInit(CurlInitFlag.All);
-        }
 
 
         internal static async Task<(HttpStatusCode, CurlCode, WarcItem)> ScrapeAsync(CurlEasy easy, HttpRequestMessage requestMessage, string url, MemoryStream requestMs, MemoryStream responseMs, Func<CurlEasy, WarcWriter> getWriter, object syncObj, CancellationToken ct)

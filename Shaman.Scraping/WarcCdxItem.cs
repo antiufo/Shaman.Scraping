@@ -326,7 +326,7 @@ namespace Shaman.Scraping
             }
         }
     }
-    internal class WarcCdxItemRaw
+    public class WarcCdxItemRaw
     {
 
         

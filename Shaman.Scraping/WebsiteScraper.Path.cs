@@ -11,7 +11,7 @@ namespace Shaman.Scraping
     public partial class WebsiteScraper
     {
 
-        internal static string GetRelativePath(string basePath, string path)
+        public static string GetRelativePath(string basePath, string path)
         {
             Uri pathUri = new Uri(path);
             //// Folders must end in a slash

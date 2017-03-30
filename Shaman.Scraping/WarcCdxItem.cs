@@ -373,7 +373,7 @@ namespace Shaman.Scraping
 
         public static IEnumerable<WarcCdxItemRaw> Read(string v)
         {
-            return Read(File.Open(v, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete));
+            return Read(File.Open(v, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete), Path.GetExtension(v).ToLowerFast() == ".gz");
         }
 
         private static Dictionary<Utf8String, Action<WarcCdxItemRaw, Utf8String>> allSetters;
@@ -381,62 +381,89 @@ namespace Shaman.Scraping
         private static readonly Utf8String CDX = new Utf8String("CDX");
         public static IEnumerable<WarcCdxItemRaw> Read(Stream cdxStream)
         {
-            using (var reader = new Utf8StreamReader(cdxStream))
+            return Read(cdxStream, false);
+        }
+        public static IEnumerable<WarcCdxItemRaw> Read(Stream cdxStream, bool gzipped)
+        {
+            List<Action<WarcCdxItemRaw, Utf8String>> fieldSetters = null;
+            using (cdxStream)
             {
-                var fields = reader.ReadLine().Split((byte)' ');
-
-                if (allSetters == null)
+                while (true)
                 {
-                    var dict = new Dictionary<Utf8String, Action<WarcCdxItemRaw, Utf8String>>();
-                    foreach (var field in typeof(WarcCdxItemRaw).GetFields(BindingFlags.Public | BindingFlags.Instance))
+                    var textStream = gzipped ? new GZipStream(cdxStream, CompressionMode.Decompress, true) : cdxStream;
+
+                    using (var reader = new Utf8StreamReader(textStream, true))
                     {
-                        var attr = field.GetCustomAttribute<CdxLabelAttribute>();
-                        if (attr != null)
+
+                        if (fieldSetters == null)
                         {
-                            var this_ = Expression.Parameter(typeof(WarcCdxItemRaw), "this_");
-                            var value = Expression.Parameter(typeof(Utf8String), "value");
-                            dict[new Utf8String(attr.Label)] = Expression.Lambda<Action<WarcCdxItemRaw, Utf8String>>(Expression.Assign(Expression.Field(this_, field), value), this_, value).Compile();
+                            var fields = reader.ReadLine().Split((byte)' ');
+                            InitializeSetters();
+                            fieldSetters = new List<Action<WarcCdxItemRaw, Utf8String>>();
+
+                            var foundCdx = false;
+                            foreach (var label in fields)
+                            {
+                                if (!foundCdx)
+                                {
+                                    if (label == CDX)
+                                        foundCdx = true;
+                                }
+                                else
+                                {
+                                    allSetters.TryGetValue(label, out var setter);
+                                    fieldSetters.Add(setter);
+                                }
+                            }
                         }
+
+                        Utf8String[] arr = null;
+                        while (!reader.IsCompleted)
+                        {
+                            var line = reader.ReadLine();
+                            if (line.Length == 0) continue;
+
+                            line.Split((byte)' ', StringSplitOptions.None, ref arr);
+
+
+                            var item = new WarcCdxItemRaw();
+                            for (int i = 0; i < fieldSetters.Count; i++)
+                            {
+                                var value = arr[i];
+                                if (value.Length > 0 & !(value.Length == 1 && value[0] == (byte)'-'))
+                                    fieldSetters[i]?.Invoke(item, value);
+                            }
+                            yield return item;
+                            //action(item);
+                        }
+
                     }
-                    allSetters = dict;
+
+                    if (textStream == cdxStream) break;
+                    var remaining = GetRemainingUnusedBytes((GZipStream)textStream);
+                    textStream.Dispose();
+                    if (remaining == 0) break;
+                    cdxStream.Position -= remaining;
                 }
+            }
+        }
 
-                var fieldSetters = new List<Action<WarcCdxItemRaw, Utf8String>>();
-
-                var foundCdx = false;
-                foreach (var label in fields)
+        private static void InitializeSetters()
+        {
+            if (allSetters == null)
+            {
+                var dict = new Dictionary<Utf8String, Action<WarcCdxItemRaw, Utf8String>>();
+                foreach (var field in typeof(WarcCdxItemRaw).GetFields(BindingFlags.Public | BindingFlags.Instance))
                 {
-                    if (!foundCdx)
+                    var attr = field.GetCustomAttribute<CdxLabelAttribute>();
+                    if (attr != null)
                     {
-                        if (label == CDX)
-                            foundCdx = true;
-                    }
-                    else
-                    {
-                        allSetters.TryGetValue(label, out var setter);
-                        fieldSetters.Add(setter);
+                        var this_ = Expression.Parameter(typeof(WarcCdxItemRaw), "this_");
+                        var value = Expression.Parameter(typeof(Utf8String), "value");
+                        dict[new Utf8String(attr.Label)] = Expression.Lambda<Action<WarcCdxItemRaw, Utf8String>>(Expression.Assign(Expression.Field(this_, field), value), this_, value).Compile();
                     }
                 }
-
-
-                Utf8String[] arr = null;
-                while (!reader.IsCompleted)
-                {
-                    var line = reader.ReadLine();
-                    if (line.Length == 0) continue;
-
-                    line.Split((byte)' ', StringSplitOptions.None, ref arr);
-
-
-                    var item = new WarcCdxItemRaw();
-                    for (int i = 0; i < fieldSetters.Count; i++)
-                    {
-                        fieldSetters[i]?.Invoke(item, arr[i]);
-                    }
-                    yield return item;
-                    //action(item);
-                }
-
+                allSetters = dict;
             }
         }
 
@@ -571,12 +598,7 @@ namespace Shaman.Scraping
 
 
 
-                                        var deflateStream = gz.GetFieldOrProperty("deflateStream");
-                                        var buffer = deflateStream.GetFieldOrProperty("buffer");
-                                        var inflater = deflateStream.GetFieldOrProperty("inflater");
-                                        var input = inflater.GetFieldOrProperty("input");
-                                        var b = (int)input.GetFieldOrProperty("AvailableBytes");
-                                        warcStream.Position -= b;
+                                        warcStream.Position -= GetRemainingUnusedBytes(gz);
                                     }
 
 
@@ -631,6 +653,16 @@ namespace Shaman.Scraping
             }
             File.Delete(cdx);
             File.Move(cdx + ".tmp", cdx);
+        }
+
+        internal static long GetRemainingUnusedBytes(GZipStream gz)
+        {
+
+            var deflateStream = gz.GetFieldOrProperty("deflateStream");
+            var buffer = deflateStream.GetFieldOrProperty("buffer");
+            var inflater = deflateStream.GetFieldOrProperty("inflater");
+            var input = inflater.GetFieldOrProperty("input");
+            return (int)input.GetFieldOrProperty("AvailableBytes");
         }
 
         private static void WriteDate(Utf8StreamWriter writer, DateTime date)

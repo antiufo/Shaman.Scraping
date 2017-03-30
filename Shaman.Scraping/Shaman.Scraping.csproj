@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <VersionPrefix>1.0.1.1</VersionPrefix>
+    <TargetFrameworks>netstandard1.5;net46</TargetFrameworks>
+    <AssemblyOriginatorKeyFile>ShamanOpenSourceKey.snk</AssemblyOriginatorKeyFile>
+    <SignAssembly>true</SignAssembly>
+    <PublicSign Condition=" '$(OS)' != 'Windows_NT' ">true</PublicSign>
+    <DefineConstants>$(DefineConstants);WARC</DefineConstants>
+    <Authors>Andrea Martinelli</Authors>
+    <Description>A library for reading/writing WARC files and scraping websites.</Description>
+    <PackageTags>scraping;warc;crawling;crawler;website;web archive</PackageTags>
+    <PackageIconUrl>http://shaman.io/images/shaman-nuget-icon.png</PackageIconUrl>
+    <PackageProjectUrl>https://github.com/antiufo/Shaman.Scraping</PackageProjectUrl>
+  </PropertyGroup>
+  <ItemGroup />
+  <ItemGroup>
+    <PackageReference Include="Shaman.Brotli" Version="1.0.11.1" />
+    <PackageReference Include="Shaman.Configuration.Manager" Version="1.0.1.4" />
+    <PackageReference Include="Shaman.CurlSharp" Version="0.6.3.1" />
+    <PackageReference Include="Shaman.ExCSS" Version="1.0.1.2" />
+    <PackageReference Include="Shaman.ProcessUtils" Version="1.0.1.10" />
+    <PackageReference Include="Shaman.Reflection" Version="1.0.0.21" />
+    <PackageReference Include="Shaman.Tld" Version="1.0.1.3" />
+    <PackageReference Include="Shaman.ValueString" Version="1.0.2.31" />
+    <PackageReference Include="protobuf-net" Version="2.1.0" />
+    <PackageReference Include="Shaman.JsonFile" Version="1.0.1.7" />
+    <PackageReference Include="Shaman.Streams" Version="1.0.1.10" />
+    <PackageReference Include="Shaman.Streams.Utf8" Version="1.0.0.16" />
+    <PackageReference Include="Shaman.SingleThreadSynchronizationContext" Version="1.0.0.8" />
+    <PackageReference Include="System.ValueTuple" Version="4.3.0" />
+    <PackageReference Include="Shaman.Http" Version="1.0.1.7" />
+  </ItemGroup>
+  <ItemGroup Condition=" '$(TargetFramework)' == 'net46' ">
+    <PackageReference Include="Shaman.Console" Version="1.0.0.10" />
+  </ItemGroup>
+  <PropertyGroup Condition=" '$(TargetFramework)' == 'netstandard1.5' ">
+    <DefineConstants>$(DefineConstants);CORECLR</DefineConstants>
+  </PropertyGroup>
+</Project>

@@ -52,6 +52,9 @@ namespace Shaman.Scraping
         {
         }
 
+        [Configuration(CommandLineAlias = "debug-scraper-rules")]
+        static bool Configuration_DebugRules;
+
         public bool OutputAsWarc;
 #if WARC
         public Func<Uri, CurlEasy, MemoryStream, MemoryStream, string> GetDestinationWarc =
@@ -161,7 +164,9 @@ namespace Shaman.Scraping
             foreach (var item in Urls.ToList())
             {
                 if (WebsiteScraper.GetStatus(item.Value) == UrlStatus.Skipped)
+                {
                     ReconsiderForScraping(item.Key.AsUri());
+                }
             }
         }
 
@@ -177,8 +182,8 @@ namespace Shaman.Scraping
         private static bool curlInitialized;
         public WebsiteScraper()
         {
-        
-            lock(typeof(WebsiteScraper))
+#if WARC
+            lock (typeof(WebsiteScraper))
             {
                 if (!curlInitialized)
                 {
@@ -186,7 +191,8 @@ namespace Shaman.Scraping
                     curlInitialized = true;
                 }
             }
-        
+#endif
+
             syncCtx = SynchronizationContext.Current;
             threadId = Environment.CurrentManagedThreadId;
             if (syncCtx == null) throw new InvalidOperationException("The object must be used within a SynchronizationContext.");
@@ -201,6 +207,35 @@ namespace Shaman.Scraping
                 if (!OutputAsWarc) throw new InvalidOperationException("OutputAsWarc must be enabled for ArchivingHttpClient.");
                 return GetOrCreateWarcWriter(this.GetDestinationWarc(a, b, c, d));
             };
+            curlHandler.OnHtmlRetrieved = (page, url, ex) =>
+            {
+                Action update = () =>
+                {
+                    if (ex != null)
+                    {
+                        int statusCode;
+                        var webex = ex.RecursiveEnumeration(x => x.InnerException).OfType<WebException>().FirstOrDefault();
+                        if (webex != null && webex.Status != WebExceptionStatus.Success)
+                        {
+                            statusCode = (int)webex.Status;
+                        }
+                        else
+                        {
+                            statusCode = (int)HttpUtils.Error_UnknownError;
+                        }
+                        SetHttpStatus(url.AbsoluteUri, (HttpStatusCode)statusCode);
+                        SetStatus(url.AbsoluteUri, UrlStatus.Error);
+                    }
+                    if (page != null)
+                    {
+                        HtmlReceived?.Invoke(url, null, page);
+                        CrawlAndFixupLinks(null, page, page.OwnerDocument.PageUrl);
+                    }
+
+                };
+                if (Environment.CurrentManagedThreadId == threadId) update();
+                else syncCtx.Post(update);
+            };
             curlHandler.OnResponseReceived = (res, easy, reqms, resms) =>
             {
                 Action update = () =>
@@ -208,35 +243,36 @@ namespace Shaman.Scraping
                     InitDb();
 
                     var t = IsErrorStatusCode(res.StatusCode) ? UrlStatus.Error : UrlStatus.RetrievedButNotCrawled;
-                    var url = res.RequestMessage.RequestUri.AbsoluteUri;
+                    LazyUri url = null;
                     if (res.RequestMessage.Properties.TryGetValue("ShamanURL", out var shamanUrlObj))
-                    {
-                        url = ((LazyUri)shamanUrlObj).AbsoluteUri;
-                    }
-                    HtmlNode page = null;
-                    try
-                    {
-                        page = CreateShamanPage(url, res);
-                    }
-                    catch (Exception ex)
-                    {
-                        var webex = ex.RecursiveEnumeration(x => x.InnerException).OfType<WebException>().FirstOrDefault();
-                        if (webex != null && webex.Status != WebExceptionStatus.Success)
-                        {
-                            res.StatusCode = (HttpStatusCode)webex.Status;
-                        }
-                        else
-                        {
-                            res.StatusCode = (HttpStatusCode)HttpUtils.Error_UnknownError;
-                        }
-                        t = UrlStatus.Error;
-                    }
-                    if (page != null)
-                        CrawlAndFixupLinks(null, page, url.AsUri());
+                        url = (LazyUri)shamanUrlObj;
+                    else
+                        url = new LazyUri(res.RequestMessage.RequestUri);
 
+                    var ct = easy.ContentType?.ToLowerFast();
+                    if (ct != null && ct.Contains("html"))
+                    {
+                        // already handled by OnHtmlRetrieved 
+                    }
+                    else if (GetExtension(url.PathConsistentUrl) == ".css" || (ct != null && ct.StartsWith("text/css")))
+                    {
+                        resms.Position = 0;
+                        using (var sr = new StreamReader(resms, WebSiteEncoding ?? Encoding.UTF8))
+                        {
+                            CrawlCss(sr.ReadToEnd(), url.Url);
+                        }
+                        resms.Position = 0;
+                        SetStatus(url.Url, UrlStatus.Crawled);
+                    }
+                    else
+                    {
+                        resms.Position = 0;
+                        NonHtmlReceived?.Invoke(url.Url, easy, resms);
+                        resms.Position = 0;
+                    }
 
-                    SetStatus(url, t);
-                    SetHttpStatus(url, res.StatusCode);
+                    SetStatus(url.Url, t);
+                    SetHttpStatus(url.AbsoluteUri, res.StatusCode);
                 };
                 if (Environment.CurrentManagedThreadId == threadId) update();
                 else syncCtx.Post(update);
@@ -286,11 +322,14 @@ namespace Shaman.Scraping
             var metaParameters = HttpExtensionMethods.ProcessMetaParameters(lazy, options) ?? new Dictionary<string, string>();
 
             var info = HttpExtensionMethods.SendAsync(lazy, options, messageBox, alwaysCatchAndForbidRedirects: true, keepResponseAliveOnError: true, synchronous: true).AssumeCompleted();
+          
             if (info.Exception != null)
             {
                 HttpExtensionMethods.CheckErrorSelectorAsync(lazy, info, options, metaParameters, synchronous: true).AssumeCompleted();
                 throw info.Exception.Rethrow();
             }
+
+
             var html = HttpExtensionMethods.ParseHtmlAsync(info, null, null, options, metaParameters, lazy, synchronous: true).AssumeCompleted();
 
             return html;
@@ -327,6 +366,32 @@ namespace Shaman.Scraping
 
             return ignorableScripts;
         }
+
+
+        // TODO
+        public async Task ScrapeFailedImagesFromKnownHostsAsync()
+        {
+            foreach (var item in GetMatchingUrls("**fbcdn.net**"))
+            {
+                var photo = Shaman.Connectors.Facebook.Photo.TryGetPhoto(item);
+                if (photo != null)
+                {
+                    try
+                    {
+                        await photo.LoadDetailsAsync(this.ArchivingHttpClient);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex);
+                    }
+                    if (photo.LargestImage != null)
+                    {
+                        Console.WriteLine(photo.LargestImage.Url);
+                        AddToCrawl(photo.LargestImage.Url, true);
+                    }
+                }
+            }
+        }
 #endif
         public void ReconsiderForScraping(Uri item)
         {
@@ -350,6 +415,18 @@ namespace Shaman.Scraping
         {
             return ParseExclusions(string.Join("\n", files.Select(x => File.ReadAllText(x, Encoding.UTF8))));
         }
+
+        protected IDictionary<string, string> SerializedProperties
+        {
+            get
+            {
+                InitDb();
+                if (db.Content.Properties == null)
+                    db.Content.Properties = new Dictionary<string, string>();
+                return db.Content.Properties;
+            }
+        }
+
 
         public void SaveDatabase()
         {
@@ -447,12 +524,12 @@ namespace Shaman.Scraping
             };
         }
 
-        public bool IsSubfolderOfFirstUrl(string url, bool ignoreLastComponentOfInitialUrl)
+        public bool IsSubfolderOfFirstUrl(string url, bool ignoreLastComponentOfInitialUrl = false)
         {
             return IsSubfolderOfFirstUrl(url.AsUri(), ignoreLastComponentOfInitialUrl);
         }
 
-        public bool IsSubfolderOfFirstUrl(Uri url, bool ignoreLastComponentOfInitialUrl)
+        public bool IsSubfolderOfFirstUrl(Uri url, bool ignoreLastComponentOfInitialUrl = false)
         {
             return IsSubfolderOf(url, _firstAddedUrl, ignoreLastComponentOfInitialUrl);
         }
@@ -524,9 +601,15 @@ namespace Shaman.Scraping
                 ProgressFile = Path.Combine(DestinationDirectory, "Progress.pb");
             }
             Directory.CreateDirectory(DestinationDirectory);
+            lockFile = File.Open(Path.Combine(DestinationDirectory, ".lock"), FileMode.Create, FileAccess.Write, FileShare.None);
             db = JsonFile.Open<CrawlerStatus>(ProgressFile);
             db.MaximumUncommittedTime = DatabaseSaveInterval;
-            if (db.Content.Urls2 == null) db.Content.Urls2 = new Dictionary<string, ushort>();
+            if (db.Content.Urls2 == null)
+            {
+                db.Content.Urls2 = new Dictionary<string, ushort>();
+                if (Directory.EnumerateFiles(DestinationDirectory, "*.warc.gz").Any())
+                    shouldPopulateProgressDatabase = true;
+            }
             //db.Content.Urls2 = db.Content.Urls.ToDictionary(x => x.Key, x => (ushort)((int)x.Value << 11));
 
             foreach (var item in db.Content.Urls2.ToList())
@@ -535,13 +618,54 @@ namespace Shaman.Scraping
                 if (GetStatus(item.Value) == UrlStatus.Processing) SetStatus(item.Key, UrlStatus.ToCrawl);
             }
             initializingDb = false;
-            onDbInitialized?.Invoke();
+            DatabaseInitialized?.Invoke();
+
+#if WARC
+            if (shouldPopulateProgressDatabase) PopulateProgressDatabase();
+#endif
         }
 
-        internal IEnumerable<Uri> GetMatchingUrls(string model)
+        private bool shouldPopulateProgressDatabase;
+#if WARC
+        private void PopulateProgressDatabase()
+        {
+            PerformInitialization();
+            InitDefaultDelegates();
+            var warcitems = CdxIndex.Values;
+            var sp = new Scratchpad();
+            foreach (var item in warcitems)
+            {
+                sp.Reset();
+                Console.WriteLine(item.Url);
+                if (IsErrorStatusCode(item.ResponseCode))
+                {
+                    SetStatus(item.Url, UrlStatus.Error);
+                    SetHttpStatus(item.Url, item.ResponseCode);
+                }
+                else
+                {
+                    SetHttpStatus(item.Url, item.ResponseCode);
+                    using (var reader = new Utf8StreamReader(item.OpenRaw()))
+                    {
+                        reader.ReadTo((Utf8String)"\r\n\r\n");
+                        HandleHttpResponse(item.Url, sp, item.Url.AsUri(), reader, null, -1);
+                    }
+
+                }
+            }
+            SaveDatabase();
+        }
+#endif
+        public IEnumerable<Uri> GetMatchingUrls(string model)
         {
             InitDb();
             return db.Content.Urls2.Keys.Where(x => x.IsMatchSimple(model)).Select(x => x.AsUri()).ToList();
+        }
+
+        public IEnumerable<Uri> GetFailedUrls(string model)
+        {
+            InitDb();
+            return db.Content.Urls2.Where(x => GetStatus(x.Value) == UrlStatus.Error && x.Key.IsMatchSimple(model)).Select(x => x.Key.AsUri()).ToList();
         }
 
         public void SetStatus(Uri key, UrlStatus status)
@@ -618,6 +742,8 @@ namespace Shaman.Scraping
 
         public static string[] Configuration_NonMediaExtensions = new[] { ".html", ".htm", ".js", ".css", ".json" };
 
+        public string ForceLinks { get; set;}
+
         public void RewriteLinks(Uri uri)
         {
             InitDb();
@@ -631,6 +757,11 @@ namespace Shaman.Scraping
         }
         private IProgress<SimpleProgress> mainprogress;
         private int processed;
+
+        public void SetMainProgressStatus(string description)
+        {
+            mainprogress.Report(description);
+        }
 
         private const ushort MaskHttpStatus =
             0b0000_0011_1111_1111;
@@ -686,29 +817,7 @@ namespace Shaman.Scraping
             PerformInitialization();
             var folder = DestinationDirectory;
             if (folder == null) throw new ArgumentException("Neither DestinationDirectory nor DestinationDirectoryBase have been specified.");
-
-            if (ShouldScrape == null)
-            {
-                if (RewriteLink == null)
-                {
-                    var normalizer = CreateHttpsWwwNormalizer(FirstAddedUrl, false);
-                    RewriteLink = x =>
-                    {
-                        return normalizer(x);
-                    };
-                }
-
-                var lastComponent = FirstAddedUrl.AbsolutePath.SplitFast('/').LastOrDefault();
-                var ignoreLastComponent = lastComponent != null && lastComponent.Contains('.');
-                ShouldScrape = (url, prereq) =>
-                {
-                    if (IsSubfolderOfFirstUrl(url, ignoreLastComponent)) return true;
-                    if (prereq) return null;
-
-                    return false;
-                };
-                //throw new ArgumentException("ShouldScrape was not configured.");
-            }
+            InitDefaultDelegates();
 #if !WARC
             if (OutputAsWarc) throw new NotSupportedException();
 
@@ -725,7 +834,7 @@ namespace Shaman.Scraping
             var fatal = new TaskCompletionSource<bool>();
             {
                 mainprogress = CreateMainProgressDelegate != null ? CreateMainProgressDelegate() : null;
-                mainprogress.Report(new SimpleProgress(0, 1));
+                mainprogress?.Report(new SimpleProgress(0, 1));
 
 
                 tocrawl = new HashSet<string>(db.Content.Urls2.Where(x => GetStatus(x.Value).In(UrlStatus.ToCrawl, UrlStatus.Skipped)).Select(x => x.Key));
@@ -792,6 +901,166 @@ namespace Shaman.Scraping
 
         }
 
+        private void InitDefaultDelegates()
+        {
+
+            if (ForceLinks != null)
+            {
+                CollectAdditionalLinks += (url, page) =>
+                {
+                    return page.FindAll(ForceLinks).Select(x => x.TryGetLinkUrl()).Where(x => x != null).Select(x => (x, true));
+                };
+            }
+
+            if (ShouldScrape == null)
+            {
+                if (RewriteLink == null)
+                {
+                    var normalizer = CreateHttpsWwwNormalizer(FirstAddedUrl, false);
+                    RewriteLink = x =>
+                    {
+                        return normalizer(x);
+                    };
+                }
+
+                var lastComponent = FirstAddedUrl.AbsolutePath.SplitFast('/').LastOrDefault();
+                var ignoreLastComponent = lastComponent != null && lastComponent.Contains('.');
+                var rules = Rules != null ? Rules.Select(x => x.Trim()).Where(x => x.Length != 0).Select(x =>
+                {
+                    var kind = x[0];
+                    var include =
+                        kind == '+' ? true :
+                        kind == '-' ? false :
+                        throw new ArgumentException();
+                    var rest = x.Substring(1);
+                    bool? prereqOnly = null;
+                    if (rest.StartsWith("prereq:"))
+                    {
+                        rest = rest.CaptureAfter(":");
+                        prereqOnly = true;
+                    }
+                    else if (rest.StartsWith("noprereq:"))
+                    {
+                        rest = rest.CaptureAfter(":");
+                        prereqOnly = false;
+                    }
+                    if (prereqOnly != null && prereqOnly.Value != include)
+                        throw new ArgumentException("+prereq: or -noprereq: rules must be used when prerequisite condition is specified.");
+
+                    var scheme =
+                                rest == "**" ? null :
+                                rest.StartsWith("http:") ? "http" :
+                                rest.StartsWith("https:") ? "https" :
+                                rest.StartsWith("//") ? null :
+                                _firstAddedUrl.Scheme;
+
+                    var hasHost = rest.StartsWith("//") || rest.StartsWith("http:") || rest.StartsWith("https:");
+                    string hostedOn = null;
+                    string host = null;
+                    if (!hasHost && rest.Length > 0 && char.IsLetterOrDigit(rest[0]))
+                    {
+                        hostedOn = rest.TryCaptureBefore("/") ?? rest;
+                        if (!hostedOn.Contains(".")) throw new ArgumentException();
+                        rest = rest.Substring(hostedOn.Length);
+                        if (string.IsNullOrEmpty(rest)) rest = "/**";
+                        scheme = null;
+                    }
+                    else
+                    {
+                        host = rest == "**" ? null : hasHost ?
+                            rest.TryCaptureBetween("//", "/") ?? rest.CaptureAfter("//") :
+                            _firstAddedUrl.Host;
+                    }
+                    var query = rest.TryCaptureAfter("?");
+                    var mustHaveQuery =
+                        query == string.Empty ? false :
+                        query == null ? (bool?)null :
+                        true;
+                    var canHaveExtraQueryParameters = query == null || query.Contains("*");
+                    var queryParameters = query != "**" && !string.IsNullOrEmpty(query) ? (query.StartsWith("*") ? query.Substring(1) : query).SplitFast('&') : null;
+                    if (queryParameters != null && queryParameters.Any(y => y.Contains('*'))) throw new ArgumentException();
+                    var queryParametersMandatoryValues = queryParameters != null ? new string[queryParameters.Length] : null;
+                    if (queryParameters != null)
+                    {
+                        for (int i = 0; i < queryParameters.Length; i++)
+                        {
+                            if (queryParameters[i].IndexOf('=') != -1)
+                            {
+                                var val = queryParameters[i].CaptureAfter("=");
+                                queryParameters[i] = queryParameters[i].CaptureBefore("=");
+                                queryParametersMandatoryValues[i] = val;
+                                if (canHaveExtraQueryParameters) throw new Exception("Constrained parameter values are not supported when canHaveExtraQueryParameters.");
+                            }
+                        }
+                    }
+                    var path = (hasHost ? "/" + rest.CaptureAfter("//").CaptureAfter("/") : rest);
+                    if (!path.StartsWith("/") && !path.StartsWith("*")) throw new ArgumentException();
+                    path = path.TryCaptureBefore("?") ?? path;
+                    var hasEndAnchor = path.EndsWith("$");
+                    if (hasEndAnchor) path = path.Substring(0, path.Length - 1);
+                    var a = path.Replace("**", "__starstar__").Replace("*", "__star__");
+                    var pathRegex = new Regex(("^" + Regex.Escape(a) + (hasEndAnchor ? "$" : "(/.*|)$"))
+                        .Replace("__starstar__", @".*")
+                        .Replace("__star__", @"[^/\?&]+"));
+
+                    return new Func<Uri, bool, bool?>((url, prereq) =>
+                    {
+                        if (prereqOnly == true && !prereq) return null;
+                        if (prereqOnly == false && prereq) return null;
+                        //Console.WriteLine("Rule: " + x);
+                        if (scheme != null && url.Scheme != scheme) return null;
+                        if (hostedOn != null && !url.IsHostedOn(hostedOn)) return null;
+                        if (host != null && url.Host != host) return null;
+                        if (query == "**" && !url.HasQueryParameters()) return null;
+                        if (!pathRegex.IsMatch(url.AbsolutePath)) return null;
+                        if (queryParameters != null)
+                        {
+                            if (canHaveExtraQueryParameters)
+                            {
+                                var t = url.GetQueryParameters().Select(z => z.Key).ToList();
+                                if (queryParameters.Any(z => !t.Contains(z))) return null;
+                            }
+                            else
+                            {
+                                var n = 0;
+                                foreach (var item in url.GetQueryParameters())
+                                {
+                                    if (n >= queryParameters.Length) return null;
+                                    if (queryParameters[n] != item.Key) return null;
+                                    if (queryParametersMandatoryValues[n] != null && queryParametersMandatoryValues[n] != item.Value) return null;
+                                    n++;
+                                }
+                                if (n != queryParameters.Length) return null;
+                            }
+                        }
+                        else
+                        {
+                            if (!canHaveExtraQueryParameters & url.HasQueryParameters()) return null;
+                        }
+                        if (Configuration_DebugRules)
+                            Console.WriteLine(url.AbsoluteUri + " -> " + (include ? "YES" : "NO") + ": rule " + x);
+                        return include;
+                    });
+                }).ToList() : null;
+                ShouldScrape = (url, prereq) =>
+                {
+                    if (rules != null)
+                    {
+                        foreach (var rule in rules)
+                        {
+                            var z = rule(url, prereq);
+                            if (z != null) return z;
+                        }
+                    }
+                    if (IsSubfolderOfFirstUrl(url, ignoreLastComponent)) return true;
+                    if (prereq) return null;
+
+                    return false;
+                };
+                //throw new ArgumentException("ShouldScrape was not configured.");
+            }
+        }
+
         public void AddToCrawl(IEnumerable<Uri> urls)
         {
             foreach (var item in urls)
@@ -800,13 +1069,15 @@ namespace Shaman.Scraping
             }
         }
 
+
         private string _suggestedNameFallback;
         private Uri _firstAddedUrl;
         public Uri FirstAddedUrl => _firstAddedUrl;
-        private event Action onDbInitialized;
+        public event Action DatabaseInitialized;
         public void AddToCrawl(string url, bool isPrerequisite = false)
         {
             CheckDisposed();
+            if (url.StartsWith("data:")) return;
             if (_firstAddedUrl == null)
             {
                 _firstAddedUrl = url.AsUri();
@@ -818,7 +1089,7 @@ namespace Shaman.Scraping
 
             if (initializingDb)
             {
-                onDbInitialized += () => AddToCrawl(url, isPrerequisite);
+                DatabaseInitialized += () => AddToCrawl(url, isPrerequisite);
                 return;
             }
             InitDb();
@@ -898,7 +1169,8 @@ namespace Shaman.Scraping
         private List<CurlEasy> pooledEasyHandles = new List<CurlEasy>();
 
 
-        public event Action<Uri, CurlEasy, Stream> OnNonHtmlReceived;
+        public event Action<Uri, CurlEasy, Stream> NonHtmlReceived;
+        public event Action<Uri, CurlEasy, HtmlNode> HtmlReceived;
 
         private async Task ProcessPageWarcAsync(string pageUrl, Scratchpad scratchpad, IProgress<SimpleProgress> progress)
         {
@@ -910,7 +1182,8 @@ namespace Shaman.Scraping
 
             processed++;
             var pageUrlUrl = pageUrl.AsUri();
-            if (ShouldScrape(pageUrlUrl, IsPrerequisite(db.Content.Urls2[pageUrl])) == false)
+            var prereq = IsPrerequisite(db.Content.Urls2[pageUrl]);
+            if (ShouldScrape(pageUrlUrl, prereq) == false)
             {
                 SetStatus(pageUrl, UrlStatus.Skipped);
             }
@@ -920,7 +1193,7 @@ namespace Shaman.Scraping
                 if (!HttpUtils.UrisEqual(pageUrlUrl, rewritten))
                 {
                     SetStatus(pageUrl, UrlStatus.Skipped);
-                    AddToCrawl(rewritten);
+                    AddToCrawl(rewritten, prereq);
                 }
                 else
                 {
@@ -931,15 +1204,9 @@ namespace Shaman.Scraping
 
                     if (pageUrl.Contains("#$"))
                     {
-                        using (var response = await pageUrl.AsUri().GetAsync(new WebRequestOptions()
-                        {
-                            AllowCachingEvenWithCustomRequestOptions = true,
-                            Cookies = Cookies,
-                            CustomHttpClient = ArchivingHttpClient
-                        }))
-                        {
-                            // do nothing
-                        }
+                        await PerformInterRequestDelayAsync();
+                        
+                        var response = await pageUrl.AsUri().GetHtmlNodeAsync(MakeNewWebRequestOptions());
                     }
                     else
                     {
@@ -951,6 +1218,8 @@ namespace Shaman.Scraping
                         hasAwaited = true;
                         easy.Cookie = Cookies;
                         easy.ConnectTimeout = 30000;
+                        await PerformInterRequestDelayAsync();
+
                         var (errorStatusCode, curlCode, warcItem) = await ScrapeAsync(easy, null, pageUrl, requestMs, responseMs, es =>
                         {
                             if (IsErrorStatusCode((HttpStatusCode)es.ResponseCode)) return null;
@@ -971,45 +1240,8 @@ namespace Shaman.Scraping
                         else
                         {
                             responseMs.Position = 0;
-                            Uri location = null;
 
-                            using (var stream = WarcItem.OpenHttp(new Utf8StreamReader(responseMs), scratchpad, pageUrlUrl, responseMs.Length, out var payloadLength, out var redirectLocation, out var responseCode, out var contentType, out var lastModified, null))
-                            {
-
-
-                                if (location != null)
-                                {
-                                    AddToCrawl(location);
-                                    SetStatus(pageUrl, UrlStatus.Redirect);
-                                }
-                                else
-                                {
-                                    var ct = easy.ContentType?.ToLowerFast();
-
-                                    if (ct != null && ct.Contains("html"))
-                                    {
-                                        var doc = new HtmlDocument();
-                                        doc.Load(stream, WebSiteEncoding);
-                                        doc.SetPageUrl(pageUrlUrl);
-                                        CrawlAndFixupLinks(null, doc.DocumentNode, pageUrlUrl);
-                                        SetStatus(pageUrl, UrlStatus.Crawled);
-                                    }
-                                    else if (GetExtension(pageUrlUrl) == ".css" || (ct != null && ct.StartsWith("text/css")))
-                                    {
-                                        using (var sr = new StreamReader(stream, WebSiteEncoding ?? Encoding.UTF8))
-                                        {
-                                            CrawlCss(sr.ReadToEnd(), pageUrlUrl);
-                                        }
-
-                                        SetStatus(pageUrl, UrlStatus.Crawled);
-                                    }
-                                    else
-                                    {
-                                        OnNonHtmlReceived?.Invoke(pageUrlUrl, easy, stream);
-                                        SetStatus(pageUrl, UrlStatus.Downloaded);
-                                    }
-                                }
-                            }
+                            HandleHttpResponse(pageUrl, scratchpad, pageUrlUrl, responseMs, easy, responseMs.Length);
                         }
 
 
@@ -1027,7 +1259,47 @@ namespace Shaman.Scraping
             }
         }
 
+        private void HandleHttpResponse(string pageUrl, Scratchpad scratchpad, Uri pageUrlUrl, Stream responseMs, CurlEasy easy, long httpResponseLength)
+        {
+            using (var stream = WarcItem.OpenHttp(new Utf8StreamReader(responseMs), scratchpad, pageUrlUrl, httpResponseLength, out var payloadLength, out var redirectLocation, out var responseCode, out var contentType, out var lastModified, null))
+            {
 
+
+                if (redirectLocation != null)
+                {
+                    AddToCrawl(redirectLocation);
+                    SetStatus(pageUrl, UrlStatus.Redirect);
+                }
+                else
+                {
+                    var ct = contentType.Length == 0 ? null : contentType.ToStringCached().ToLowerFast();
+
+                    if (ct != null && ct.Contains("html"))
+                    {
+                        var doc = new HtmlDocument();
+                        doc.Load(stream, WebSiteEncoding);
+                        doc.SetPageUrl(pageUrlUrl);
+                        HtmlReceived?.Invoke(pageUrlUrl, easy, doc.DocumentNode);
+                        CrawlAndFixupLinks(null, doc.DocumentNode, pageUrlUrl);
+                        SetStatus(pageUrl, UrlStatus.Crawled);
+                    }
+                    else if (GetExtension(pageUrlUrl) == ".css" || (ct != null && ct.StartsWith("text/css")))
+                    {
+                        using (var sr = new StreamReader(stream, WebSiteEncoding ?? Encoding.UTF8))
+                        {
+                            CrawlCss(sr.ReadToEnd(), pageUrlUrl);
+                        }
+
+                        SetStatus(pageUrl, UrlStatus.Crawled);
+                    }
+                    else
+                    {
+                        NonHtmlReceived?.Invoke(pageUrlUrl, easy, stream);
+                        SetStatus(pageUrl, UrlStatus.Downloaded);
+                    }
+                }
+            }
+        }
 
         private WarcWriter GetOrCreateWarcWriter(string name)
         {
@@ -1157,6 +1429,7 @@ namespace Shaman.Scraping
                         var now = DateTime.UtcNow;
                         var options = new WebRequestOptions();
                         options.Cookies = Cookies;
+                        await PerformInterRequestDelayAsync();
                         using (var response = await pageUrlUrl.GetAsync(options))
                         {
 
@@ -1298,6 +1571,12 @@ namespace Shaman.Scraping
             return p();
         }
 
+        private async Task PerformInterRequestDelayAsync()
+        {
+            if (InterRequestDelay.Ticks != 0)
+                await Task.Delay(InterRequestDelay);
+        }
+
         private void AddMeta(HtmlNode head, string name, string value)
         {
             var meta = head.OwnerDocument.CreateElement("meta");
@@ -1311,20 +1590,21 @@ namespace Shaman.Scraping
         public void CrawlLinks(HtmlNode page)
         {
             var url = page.OwnerDocument.PageUrl;
-            CrawlAndFixupLinks(null, page, url);
+            CrawlAndFixupLinks(null, page, url, force: true);
             SetStatus(url, UrlStatus.Crawled);
         }
 
-        private void CrawlAndFixupLinks(string path, HtmlNode page, Uri pageurl)
+        private void CrawlAndFixupLinks(string path, HtmlNode page, Uri pageurl, bool force = false)
         {
             db.Content.Urls2.TryGetValue(pageurl.AbsoluteUri, out var s);
             var shouldScrape = ShouldScrape(pageurl, IsPrerequisite(s));
-            if (shouldScrape == false) throw new Exception();
+            if (!force && shouldScrape == false) return;
             var shouldAddLinksToCrawl = shouldScrape == true;
 
 
-            foreach (var collect in _collectAdditionalLinks.ToList())
+            for (int i = 0; i < _collectAdditionalLinks.Count; i++)
             {
+                var collect = _collectAdditionalLinks[i];
                 var r = collect(pageurl, page);
                 if (r != null)
                 {
@@ -1698,8 +1978,8 @@ namespace Shaman.Scraping
         }
 
         public Encoding WebSiteEncoding { get; set; }
-        public long? MaxSize;
-        public TimeSpan DatabaseSaveInterval = TimeSpan.FromMinutes(2);
+        public long? MaxSize { get; set; }
+        public TimeSpan DatabaseSaveInterval { get; set; } = TimeSpan.FromMinutes(10);
 
 
 #if WARC
@@ -1709,6 +1989,8 @@ namespace Shaman.Scraping
         public string Cookies { get; set; }
 
         private List<Func<Uri, HtmlNode, IEnumerable<(Uri, bool)>>> _collectAdditionalLinks = new List<Func<Uri, HtmlNode, IEnumerable<(Uri, bool)>>>();
+        public TimeSpan InterRequestDelay { get; set; }
+
         public event Func<Uri, HtmlNode, IEnumerable<(Uri, bool)>> CollectAdditionalLinks
         {
             add { _collectAdditionalLinks.Add(value); }
@@ -1754,17 +2036,22 @@ namespace Shaman.Scraping
                     AppendNewItemsToIndex();
                 }
 #endif
-            
+
 #if WARC
                 ArchivingHttpClientHandler.Dispose();
                 ArchivingHttpClient.Dispose();
 #endif
                 db = null;
-
+                var p = lockFile?.Name;
+                lockFile?.Dispose();
+                lockFile = null;
+                if (p != null) File.Delete(p);
                 disposed.TrySetResult(true);
                 cts?.Cancel();
             }
         }
+
+        private FileStream lockFile;
 #if WARC
         private void AppendNewItemsToIndex()
         {
@@ -1812,7 +2099,12 @@ namespace Shaman.Scraping
             return new WebRequestOptions()
             {
                 AllowCachingEvenWithCustomRequestOptions = true,
-                CustomHttpClient = ArchivingHttpClient
+                CustomHttpClient = ArchivingHttpClient,
+                Cookies = this.Cookies,
+                HtmlRetrieved = (page, url, ex) =>
+                {
+                    ((CurlWarcHandler)this.ArchivingHttpClientHandler).OnHtmlRetrieved(page, url, ex);
+                }
             };
         }
 #endif
@@ -1824,6 +2116,9 @@ namespace Shaman.Scraping
             //public Dictionary<string, UrlStatus> Urls;
             [ProtoMember(2)]
             public Dictionary<string, ushort> Urls2;
+
+            [ProtoMember(3)]
+            public Dictionary<string, string> Properties;
         }
 
 
@@ -1841,7 +2136,7 @@ namespace Shaman.Scraping
             if (hash != -1)
                 url = url.Substring(0, hash);
 
-            easy.UserAgent = "Mozilla/5.0 (Windows NT 10.0; WOW64; rv:51.0) Gecko/20100101 Firefox/51.0";
+            easy.UserAgent = "Mozilla/5.0 (Windows NT 10.0; WOW64; rv:52.0) Gecko/20100101 Firefox/52.0";
             easy.Url = url;
 
             easy.HeaderFunction = (byte[] buf, int size, int nmemb, Object extraData) =>
@@ -1871,7 +2166,15 @@ namespace Shaman.Scraping
             };
             easy.SslContextFunction = OnSslContext;
             easy.Verbose = true;
+            
+            
             easy.CaInfo = ConfigurationManager.CombineRepositoryOrEntrypointPath("Shaman.Scraping/curl-ca-bundle.crt");
+            /*
+            easy.CaPath = null;
+            easy.SslVerifyhost = false;
+            easy.SslVerifyPeer = false;
+            */
+
             easy.WriteFunction = (byte[] buf, int size, int nmemb, Object extraData) =>
             {
                 if (ct.IsCancellationRequested) return 0;
@@ -1937,7 +2240,6 @@ namespace Shaman.Scraping
             easy.HttpHeader = curlRequestHeaders;
             // easy.Proxy = "http://localhost:8888";
             CurlCode code = default(CurlCode);
-
             await Task.Run(() => code = easy.Perform());
             ct.ThrowIfCancellationRequested();
             WarcItem warcItem = null;
@@ -1980,12 +2282,13 @@ namespace Shaman.Scraping
 #endif
 
 
-
+        public string[] Rules { get; set; }
 
 
 #if DOM_EMULATION
 
         public Func<DomEmulator, Task<bool>> OnPageInteract { get; set; }
+
 
         public async Task<bool> EmulateDomAsync(Uri url)
         {
@@ -2032,6 +2335,7 @@ namespace Shaman.Scraping
         public static bool IsMatchSimple(this string url, string model)
         {
             Regex r;
+            if (model == "**") return true;
             lock (UrlModelCache)
             {
                 r = UrlModelCache.TryGetValue(model);
@@ -2116,6 +2420,10 @@ namespace Shaman.Scraping
         {
             return url.Query.Length <= 1;
         }
+        public static bool HasQueryParameters(this Uri url)
+        {
+            return url.Query.Length > 1;
+        }
 
 
 
@@ -2135,6 +2443,31 @@ namespace Shaman.Scraping
         public static bool PathContains(this Uri url, string str)
         {
             return url.AbsolutePath.Contains(str);
+        }
+
+        private static string ConcatCached(string a, string b)
+        {
+            var sb = ReseekableStringBuilder.AcquirePooledStringBuilder();
+            sb.Append(a);
+            sb.Append(b);
+            var z = sb.ToStringCached();
+            ReseekableStringBuilder.Release(sb);
+            return z;
+        }
+
+        public static bool PathContainsComponent(this Uri url, string str)
+        {
+            var z = str;
+            if (!z.StartsWith("/")) z = ConcatCached("/", str);
+            if (z.EndsWith("/")) z = z.SubstringCached(0, z.Length - 1);
+            if (url.AbsolutePath.EndsWith(z)) return true;
+            if (url.AbsolutePath.Contains(ConcatCached(z, "/"))) return true;
+            return false;
+            //if(url.AbsolutePath.Contains(str + "/"))
+        }
+        public static bool PathEndsWith(this Uri url, string str)
+        {
+            return url.AbsolutePath.EndsWith(str);
         }
 
         public static bool Contains(this Uri url, string str)

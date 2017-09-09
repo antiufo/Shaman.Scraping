@@ -1,4 +1,5 @@
 ﻿using CurlSharp;
+using Shaman.Dom;
 using Shaman.Scraping;
 using System;
 using System.Collections.Generic;
@@ -16,6 +17,7 @@ namespace Shaman.Runtime
     {
         public override bool SupportsAutomaticDecompression => true;
 
+        public Action<HtmlNode, Uri, Exception> OnHtmlRetrieved;
         public Action<HttpResponseMessage, CurlEasy, MemoryStream, MemoryStream> OnResponseReceived;
 
         private object lockObj = new object();
@@ -194,7 +196,6 @@ namespace Shaman.Runtime
                     responseMs?.Dispose();
                     return;
                 }
-
                 if (pooledEasyHandles != null && easy != null)
                     pooledEasyHandles.Add(easy);
                 if (pooledRequestMemoryStreams != null && requestMs != null)

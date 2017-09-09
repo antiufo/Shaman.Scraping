@@ -46,6 +46,8 @@ namespace Shaman.Scraping
                                 ended = true;
                                 return 0;
                             }
+                            //throw new InvalidDataException();
+                            if (len == 0) { ended = true; return 0; } // weird?
                             throw new InvalidDataException();
                         }
                         if (ch == 13)

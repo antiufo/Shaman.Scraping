@@ -17,7 +17,8 @@ namespace Shaman.Scraping
         {
             //this.UrlPriorityDelegate = x => (x.StartsWith("https://www.reddit.com/") ? 1000 : 1000) + x.Length;
 
-            this.Cookies = "over18=1";
+            if (this.Cookies == null)
+                this.Cookies = "over18=1";
             if (Subreddit == null) throw new ArgumentNullException("Subreddit");
             var root = ("https://www.reddit.com/r/" + Subreddit + "/top/?sort=top&t=all").AsUri();
 

@@ -13,6 +13,7 @@ using System.IO;
 using System.Threading;
 using Shaman.Types;
 using Shaman.Dom;
+using System.Net.Http;
 
 namespace Shaman.Connectors.Facebook
 {
@@ -61,7 +62,7 @@ namespace Shaman.Connectors.Facebook
             if (detailLevel == DetailLevel.D)
             {
 #else
-        public async Task LoadDetailsAsync()
+        public async Task LoadDetailsAsync(HttpClient client = null)
         {
             {
 #endif
@@ -72,7 +73,15 @@ namespace Shaman.Connectors.Facebook
                 l.AppendFragmentParameter("$cookie-xs", Blog.Configuration_FacebookXs);
                 var page = await l.GetHtmlNodeAsync();
 #else
-                var page = await GetNodeAsync(l.Url);
+                HtmlNode page;
+                if (client != null)
+                {
+                    page = await l.Url.GetHtmlNodeAsync(new WebRequestOptions() { CustomHttpClient = client, AllowCachingEvenWithCustomRequestOptions = true });
+                }
+                else
+                {
+                    page = await GetNodeAsync(l.Url);
+                }
 #endif
                 var url = page.GetLinkUrl("a:text-is('View Full Size')");
 #if SHAMAN

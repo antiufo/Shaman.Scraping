@@ -33,6 +33,8 @@ namespace Shaman.Scraping
             }
         }
 
+
+        
         protected override void Initialize()
         {
 
@@ -41,7 +43,13 @@ namespace Shaman.Scraping
             var p = Page;
             if (p.StartsWith("http:") || p.StartsWith("https:"))
             {
-                p = p.AsUri().AbsolutePath.Trim('/');
+                var uu = p.AsUri();
+                p = uu.AbsolutePath.Trim('/');
+
+                if (p.StartsWith("groups/")) p = "groups/" + uu.GetPathComponent(1);
+                else if (uu.AbsolutePath.StartsWith("/profile.php")) p = uu.GetQueryParameter("id");
+
+                Page = p;
             }
             if (p.StartsWith("groups-")) p = "groups/" + p.TrimStart("groups-");
             var root = ("https://m.facebook.com/" + p.TrimStart("/")).AsUri();
@@ -56,57 +64,91 @@ namespace Shaman.Scraping
 
             if (!ScrapeMobileVersion)
             {
+
+                DatabaseInitialized += () =>
+                {
+                    if (fburl != null)
+                    {
+                        if (fburl.Contains("group/"))
+                        {
+                            InitGroup();
+                        }
+                    }
+                };
                 UrlPriorityDelegate = x => (x.Contains("/ajax/") ? -1000 : 0) + x.Length;
                 root = ("https://www.facebook.com" + root.PathAndQuery).AsUri();
                 this.ShouldScrape = (url, prereq) =>
                 {
+                    if (url.IsHostedOn("fbcdn.net") && url.AbsolutePath.EndsWith(".js")) return false;
+                    if (url.IsHostedOn("fbcdn.net") && url.AbsolutePath.EndsWith(".css")) return false;
+
+                    //if (url.IsHostedOn("fbcdn.net")) return false;
+
                     if (prereq && DownloadThumbnailsAndCss) return true;
                     if (Utils.Equals(url, root)) return true;
+                    if (url.IsHostedOn("facebook.com") && url.HasExactlyQueryParameters("id") && url.GetQueryParameter("id") == Page) return true;
                     if (url.Fragment.StartsWith("#$"))
                     {
                         if (url.PathContains("GroupEntstreamPagelet")) return true;
+                        if (url.PathContains("/ProfileTimelineSectionPagelet")) return true;
                     }
                     if (url.PathStartsWith("/pages_reaction_units")) return true;
                     return false;
                 };
                 this.AddToCrawl(root);
-                OnNonHtmlReceived += (url, easy, body) =>
+                NonHtmlReceived += (url, easy, body) =>
                 {
                     if (url.PathStartsWith("/pages_reaction_units"))
                     {
                         ProcessPageReactionUnitsRequest(url, body);
                     }
                 };
+
+  
+
                 CollectAdditionalLinks += (url, page) =>
                 {
 
-                    if (HttpUtils.UrisEqual(url, root))
+                    if (HttpUtils.UrisEqual(url, root) || (url.IsHostedOn("facebook.com") && url.HasExactlyQueryParameters("id") && url.GetQueryParameter("id") == Page))
                     {
-                        var fburl = page.GetValue(":property('al:android:url')");
-                        var numericId = fburl.Capture(@"/(\d+)$");
-
+                        fburl = page.TryGetValue(":property('al:android:url')");
+                        if (fburl == null) return Enumerable.Empty<(Uri, Boolean)>();
+                        fbNumericId = fburl.Capture(@"/(\d+)(\?.*)?$");
                         
                         if (fburl.Contains("group/"))
                         {
-                            var initialUrl = ReadFromExample("fbgroup");
-                            initialUrl.AppendFragmentParameter("$json-query-data.group_id~", numericId);
-
-                            AddComplexAjax(initialUrl.Url, "§£json-query-data.end_cursor={script:json-token('£jscc_map'):json-token('£end_cursor')}");
+                            InitGroup();
                         }
                         else if (fburl.Contains("page/"))
                         {
                             var initialUrl = ReadFromExample("fbpage");
                             //defaultParameters = initialUrl.FragmentParameters.ToDictionary();
 
-                            initialUrl.AppendQueryParameter("page_id", numericId);
+                            initialUrl.AppendQueryParameter("page_id", fbNumericId);
 
                             AddToCrawl(initialUrl.Url);
                         }
                         else if (fburl.Contains("profile/"))
                         {
-                            var initialUrl = ReadFromExample("fbprofile");
-                            initialUrl.AppendQueryParameter("profile_id", numericId);
-                            AddToCrawl(initialUrl.Url);
+                            AddToCrawl(root);
+                            
+                            AddToCrawl(root + "/about?section=overview", true);
+                            AddToCrawl(root + "/about?section=education", true);
+                            AddToCrawl(root + "/about?section=living", true);
+                            AddToCrawl(root + "/about?section=contact-info", true);
+                            AddToCrawl(root + "/about?section=relationship", true);
+                            AddToCrawl(root + "/about?section=bio", true);
+                            AddToCrawl(root + "/about?section=year-overviews", true);
+                            AddToCrawl(root + "/likes", true);
+                            AddToCrawl(root + "/photos", true);
+                            AddToCrawl(root + "/friends", true);
+                            
+                            var pageletToken = page.TryGetValue(@"script:json-token('jscc_map:'):json-token('£pagelet_token')");
+
+                            if (pageletToken == null)
+                                pageletToken = page.GetValue("script:json-token('pagelet_token:')");
+
+                            AddFacebookProfileSegment(((long)((DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds)), fbNumericId, pageletToken);
                         }
                         else throw new NotSupportedException("Not supported: " + fburl);
 
@@ -121,12 +163,62 @@ namespace Shaman.Scraping
                 CollectAdditionalLinks += (url, page) =>
                 {
                     //Console.WriteLine("Size: " + page.OuterHtml.Length);
-                    var html = page.FindAll(page.OwnerDocument.IsJson() ? Configuration_PageReactionUnitsSelector : Configuration_PageletExtractionSelector);
+                    var html =
+                        page.OwnerDocument.IsJson() ?
+                        page.FindAll(Configuration_PageReactionUnitsSelector) :
+                        page.FindAll(Configuration_PageletExtractionSelector).Concat(new[] { RehydrateHtml(page) });
+                        //: Configuration_PageletExtractionSelector);
+                    var hasSetMainProgress = false;
 
-                    return html.SelectMany(x =>
+                    void MaybeSetMainProgress(HtmlNode y)
                     {
-                        return x.DescendantsAndSelf().Select(y =>
+                        if (y != null && !hasSetMainProgress && y.TagName == "abbr")
                         {
+                            var datestr = y.GetAttributeValue("title") ?? y.GetText();
+                            if (datestr != null)
+                            {
+                                hasSetMainProgress = true;
+                                SetMainProgressStatus(datestr);
+                            }
+                        }
+                    }
+
+                    MaybeSetMainProgress(page.FindSingle("abbr"));
+
+                    var mindate = (long?)null;
+
+                    var zzz = html.SelectMany(x =>
+                    {
+
+                        if (fburl.Contains("profile/"))
+                        {
+                            var articles = x.FindAll("[data-ftr]");
+                            foreach (var article in articles)
+                            {
+                                var abbr = article.FindSingle("abbr");
+                                if (abbr != null && abbr.Ancestors().Last(y => y.GetAttributeValue("data-ftr") != null) == article)
+                                {
+                                    var utime = abbr.GetAttributeValue("data-utime");
+                                    if (utime != null)
+                                    {
+                                        var ut = long.Parse(utime);
+                                        /*
+                                        if (new DateTime(1970, 1, 1, 0, 0, 0).AddSeconds(ut).Year == 2015)
+                                        {
+
+                                        }*/
+                                        if (mindate == null || mindate.Value > ut)
+                                            mindate = ut;
+                                    }
+                                }
+                            }
+                        }
+
+
+                        var zz = x.DescendantsAndSelf().Select(y =>
+                        {
+                            MaybeSetMainProgress(y);
+
                             var ajaxify = y.GetAttributeValue("ajaxify");
                             if (ajaxify != null && ajaxify.StartsWith("/pages_reaction_units/"))
                             {
@@ -141,8 +233,25 @@ namespace Shaman.Scraping
                                 return (Url: z, y.TagName.In("img", "script") || y.GetAttributeValue("rel")?.ToLowerFast() == "stylesheet");
                             }
                             return (null, false);
-                        }).Where(y => y.Url != null);
-                    });
+
+
+
+                        }).Where(y => y.Url != null).ToList();
+
+
+
+
+                        return zz;
+                    }).ToList();
+
+
+                    if (mindate != null)
+                    {
+                        var pageletToken = html.Select(x => x.TryGetValue("script:json-token('£jscc_map'):json-token('£pagelet_token')")).FirstOrDefault(x => x != null);
+                        if (pageletToken != null)
+                            AddFacebookProfileSegment(mindate.Value - 1, fbNumericId, pageletToken);
+                    }
+                    return zzz;
                 };
 
             }
@@ -176,6 +285,7 @@ namespace Shaman.Scraping
                 {
                     if (DownloadThumbnailsAndCss && isPrerequisite) return true;
                     if (url == root) return true;
+                    if (url.IsHostedOn("facebook.com") && url.HasExactlyQueryParameters("id") && url.GetQueryParameter("id") == Page) return true;
                     if (!url.IsHostedOn("m.facebook.com")) return false;
                     if (url.GetQueryParameter("srw") != null)
                     {
@@ -203,6 +313,44 @@ namespace Shaman.Scraping
                 };
                 this.AddToCrawl(root);
             }
+        }
+
+        private void InitGroup()
+        {
+            var initialUrl = ReadFromExample("fbgroup");
+            initialUrl.AppendFragmentParameter("$json-query-data.group_id~", fbNumericId);
+
+            AddComplexAjax(initialUrl.Url, "§£json-query-data.end_cursor={script:json-token('£jscc_map'):json-token('£end_cursor')}");
+        }
+
+        private HtmlNode RehydrateHtml(HtmlNode page)
+        {
+            foreach (var code in page.FindAll("code"))
+            {
+                var comment = code.FirstChild;
+                if (comment != null && comment.NodeType == HtmlNodeType.Comment)
+                {
+                    var c = ((HtmlCommentNode)comment).Comment;
+                    var doc = FizzlerCustomSelectors.CreateDocument(page.OwnerDocument);
+                    doc.LoadHtml(c.SubstringValue(4, c.Length - 3 - 4).Trim().ToString());
+                    var prev = code;
+                    for (int i = 1; i < doc.DocumentNode.ChildNodes.Count; i++)
+                    {
+                        prev = code.ParentNode.InsertAfter(doc.DocumentNode.ChildNodes[i], prev);
+                    }
+                    code.ParentNode.RemoveChild(code);
+                }
+            }
+            return page;
+        }
+
+        private void AddFacebookProfileSegment(long date, string profileId, string pageletToken)
+        {
+            var url = ReadFromExample("fbprofile");
+            url.AppendFragmentParameter("$json-query-data.profile_id~", profileId);
+            url.AppendFragmentParameter("$json-query-data.pagelet_token", pageletToken); 
+            url.AppendFragmentParameter("$json-query-data.end~", date.ToString());
+            AddToCrawl(url.Url);
         }
 
         private void ProcessPageReactionUnitsRequest(Uri url, Stream body)
@@ -242,7 +390,7 @@ $json-query-data.multi_permalinks~=--
             }
             else if (name == "fbpage")
             {
-                text= @"
+                text = @"
 https://www.facebook.com/pages_reaction_units/more/?
 surface=www_pages_home&
 unit_count=8&
@@ -250,11 +398,22 @@ cursor={""timeline_section_cursor"":{},""has_next_page"":true}&
 __a = 1
 ";
             }
+            else if (name == "fbprofile")
+            {
+
+                text = @"
+https://www.facebook.com/ajax/pagelet/generic.php/ProfileTimelineSectionPagelet?
+__a=1&
+ajaxpipe=1#
+$json-query-data.start~=0&
+$json-query-data.query_type~=8&
+$json-query-data.page_index~=10
+";
+            }
             else
             {
                 throw new NotImplementedException();
             }
-
 
             //text = File.ReadAllText(@"c:\temp\" + name + "-req.txt");
             return new LazyUri(text.RegexReplace(@"\s+", string.Empty).AsUri());
@@ -272,6 +431,8 @@ __a = 1
         [Configuration]
         private static string Configuration_PageReactionUnitsSelector = @"__html:reparse-html";
         public bool ScrapeMobileVersion;
+        private string fburl { get => SerializedProperties.TryGetValue("fburl"); set => SerializedProperties["fburl"] = value; }
+        private string fbNumericId { get => SerializedProperties.TryGetValue("fbNumericId"); set => SerializedProperties["fbNumericId"] = value; }
 
         public void CreatePostList()
         {
@@ -279,7 +440,7 @@ __a = 1
             var posts = new List<Post>();
             foreach (var warcItem in CdxIndex.Values)
             {
-                if ((warcItem.Url.Contains("facebook.com/pages_reaction_units/") || warcItem.ContentType.Contains("html")) && warcItem.Url.Contains("facebook.com"))
+                if ((warcItem.Url.Contains("facebook.com/pages_reaction_units/") || warcItem.Url.Contains("/ProfileTimelineSectionPagelet") || warcItem.ContentType.Contains("html")) && warcItem.Url.Contains("facebook.com"))
                 {
                     var l = new List<HtmlNode>();
                     if (warcItem.ContentType.Contains("html"))
@@ -293,7 +454,7 @@ __a = 1
                         l.AddRange(GetHtmlPiecesFromJson(warcItem.ReadText(), warcItem.Url.AsUri()));
                     }
 
-                    foreach (var article in l.SelectMany(x => x.FindAll("[role='article']")))
+                    foreach (var article in l.SelectMany(x => x.FindAll("[data-ftr]"/*"[role='article']"*/)))
                     {
                         var dateel = article.FindSingle("abbr");
                         if (dateel == null) continue;
@@ -334,7 +495,7 @@ __a = 1
                 }
             }
 
-            posts = posts.GroupBy(x => x.Id).Select(x => x.First()).OrderByDescending(x => x.Date).ToList();
+            posts = posts.GroupBy(x => x.Id == 0 ? x.Date.Ticks : x.Id).Select(x => x.First()).OrderByDescending(x => x.Date).ToList();
             posts.SaveTable(Path.Combine(DestinationDirectory, "Posts.csv"));
 
 
@@ -378,8 +539,14 @@ __a = 1
                 {
                     postid = Photo.TryGetPhoto(permalink).Id.ToString();
                 }
+                else if (postid == "story")
+                {
+                    // Story has not post id.
+                    // Example: Started working at X https://www.facebook.com/andmartinelli/timeline/story?ut=32&wstart=-2051193600&wend=2147483647&hash=10204046071940525&pagefilter=3
+                    return "0";
+                }
                 //postid = permalink.AbsolutePath.CaptureBetween("/permalink/", "/");
-                return postid;
+                return postid.TryCaptureBefore(":") ?? postid; // eg. /dammuozz/posts/10203333260765075:0
             }
 
             var u = article.TryGetLinkUrl("a:text-is('Full Story')");

@@ -38,6 +38,7 @@ namespace Shaman.Scraping
         public DateTime? LastModified;
         public string ContentType;
         public HttpStatusCode ResponseCode;
+        public long FullLength = -1;
 
 
         public static IReadOnlyList<WarcItem> ReadIndex(string cdxPath)
@@ -164,10 +165,8 @@ namespace Shaman.Scraping
 
         public Stream OpenStream(Action<Utf8String, Utf8String> onHttpHeader)
         {
-            var z = File.Open(WarcFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            z.Position = CompressedOffset;
+            var gz = OpenRaw();
 
-            var gz = new GZipStream(new LimitedStream(z, CompressedLength), System.IO.Compression.CompressionMode.Decompress);
             var reader = new Utf8StreamReader(gz);
             var warcHeader = reader.ReadTo((Utf8String)"\r\n\r\n");
 
@@ -178,7 +177,17 @@ namespace Shaman.Scraping
                 PayloadLength = payloadLength;
             return response;
         }
-        
+
+        public Stream OpenRaw()
+        {
+            var z = File.Open(WarcFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            z.Position = CompressedOffset;
+
+            var gz = new GZipStream(new LimitedStream(z, CompressedLength), System.IO.Compression.CompressionMode.Decompress);
+            return gz;
+
+        }
+
         public Stream OpenStream()
         {
             return OpenStream(null);
@@ -242,8 +251,15 @@ namespace Shaman.Scraping
                 else if (line.StartsWith(Http_Location))
                 {
                     var val = GetHeaderValue(line).ToString();
-                    if (val.StartsWith("//")) location = new Uri(requestedUrl.Scheme + ":" + val);
-                    else location = new Uri(requestedUrl, val);
+                    try
+                    {
+                        if (val.StartsWith("//")) location = new Uri(requestedUrl.Scheme + ":" + val);
+                        else location = new Uri(requestedUrl, val);
+                    }
+                    catch(Exception ex)
+                    {
+
+                    }
                 }
                 else if (line.StartsWith(Http_ContentType) && scratchpad != null)
                 {
@@ -263,14 +279,23 @@ namespace Shaman.Scraping
             }
 
             var compressed = gzipped || brotli;
-            var currentPos = httpReader.Position - startPosition;
-            var httpBodyLength = responseLength - currentPos;
             if (compressed || chunked) payloadLength = -1;
-            if (!compressed && !chunked && payloadLength != -1 && httpBodyLength != payloadLength)
+            Stream s;
+            if (responseLength != -1)
             {
-                throw new Exception("Unexpected Content-Length.");
+                var currentPos = httpReader.Position - startPosition;
+                var httpBodyLength = responseLength - currentPos;
+
+                if (!compressed && !chunked && payloadLength != -1 && httpBodyLength != payloadLength)
+                {
+                    throw new Exception("Unexpected Content-Length.");
+                }
+                s = new LimitedStream(httpReader, httpBodyLength);
             }
-            Stream s = new LimitedStream(httpReader, httpBodyLength);
+            else
+            {
+                s = httpReader;
+            }
             if (chunked) s = new ChunkedStream(s);
             if (compressed && chunked) s = new OnDisposeConsumeStream(s);
 

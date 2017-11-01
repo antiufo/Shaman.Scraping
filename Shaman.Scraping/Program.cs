@@ -222,7 +222,9 @@ namespace Shaman.Scraping
                             // the id might also be in the redirected page
                             var user = candidates.Take(2).Select(x => x.ReadText().TryCaptureBetween("USER_ID\":\"", "\"")).FirstOrDefault(x => x != null);
                             string filename =
-                                user == "-----" ? "------.txt" :
+                                user == "100009411610822" ? "facebookcookiesanisea.txt" :
+                                user == "1485885333" ? "facebookcookies.txt" :
+                                user == "100021796298990" ? "facebookcookiesgloria.txt" :
                                 user == null || user == "0" ? (string)null :
                                 throw new ArgumentException("Unknown facebook user: " + user);
                             var stopAt = DateTime.ParseExact(File.ReadAllLines(postsCsv)[1].CaptureBefore(","), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);

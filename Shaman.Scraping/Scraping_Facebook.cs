@@ -1,14 +1,12 @@
-﻿using Shaman.Connectors.Facebook;
+﻿using Newtonsoft.Json.Linq;
+using Shaman.Connectors.Facebook;
+using Shaman.Dom;
 using Shaman.Runtime;
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Threading.Tasks;
-using Shaman.Dom;
 using System.Text;
-using Newtonsoft.Json.Linq;
 
 namespace Shaman.Scraping
 {
@@ -108,11 +106,17 @@ namespace Shaman.Scraping
 
                 CollectAdditionalLinks += (url, page) =>
                 {
-
+                    if (Stop) return null;
                     if (HttpUtils.UrisEqual(url, root) || (url.IsHostedOn("facebook.com") && url.HasExactlyQueryParameters("id") && url.GetQueryParameter("id") == Page))
                     {
                         fburl = page.TryGetValue(":property('al:android:url')");
-                        if (fburl == null) return Enumerable.Empty<(Uri, Boolean)>();
+                        var sentinel = Path.Combine(DestinationDirectory, url.AbsolutePath.StartsWith("/groups/") ? "fbgroup-not-a-member" : "fberror");
+                        if (fburl == null)
+                        {
+                            File.WriteAllText(sentinel, string.Empty, Encoding.ASCII);
+                            return Enumerable.Empty<(Uri, Boolean)>();
+                        }
+                        File.Delete(sentinel);
                         fbNumericId = fburl.Capture(@"/(\d+)(\?.*)?$");
                         
                         if (fburl.Contains("group/"))
@@ -125,6 +129,11 @@ namespace Shaman.Scraping
                             //defaultParameters = initialUrl.FragmentParameters.ToDictionary();
 
                             initialUrl.AppendQueryParameter("page_id", fbNumericId);
+                            if (UpdateUpTo != null)
+                            {
+                                refreshId = DateTime.UtcNow.ToString("yyyyMMdd");
+                                initialUrl.AppendQueryParameter("x-refresh", refreshId);
+                            }
 
                             AddToCrawl(initialUrl.Url);
                         }
@@ -152,8 +161,6 @@ namespace Shaman.Scraping
                         }
                         else throw new NotSupportedException("Not supported: " + fburl);
 
-
-
                     
 
                     }
@@ -162,12 +169,14 @@ namespace Shaman.Scraping
 
                 CollectAdditionalLinks += (url, page) =>
                 {
+                    if (Stop) return null;
                     //Console.WriteLine("Size: " + page.OuterHtml.Length);
                     var html =
                         page.OwnerDocument.IsJson() ?
                         page.FindAll(Configuration_PageReactionUnitsSelector) :
                         page.FindAll(Configuration_PageletExtractionSelector).Concat(new[] { RehydrateHtml(page) });
-                        //: Configuration_PageletExtractionSelector);
+                    //: Configuration_PageletExtractionSelector);
+                    /*
                     var hasSetMainProgress = false;
 
                     void MaybeSetMainProgress(HtmlNode y)
@@ -182,11 +191,11 @@ namespace Shaman.Scraping
                             }
                         }
                     }
+                    */
+//                    MaybeSetMainProgress(html.Select(x=>x.FindSingle("abbr"));
 
-                    MaybeSetMainProgress(page.FindSingle("abbr"));
-
-                    var mindate = (long?)null;
-
+                    
+                    var dates = new List<long>();
                     var zzz = html.SelectMany(x =>
                     {
 
@@ -195,30 +204,21 @@ namespace Shaman.Scraping
                             var articles = x.FindAll("[data-ftr]");
                             foreach (var article in articles)
                             {
-                                var abbr = article.FindSingle("abbr");
-                                if (abbr != null && abbr.Ancestors().Last(y => y.GetAttributeValue("data-ftr") != null) == article)
-                                {
-                                    var utime = abbr.GetAttributeValue("data-utime");
-                                    if (utime != null)
-                                    {
-                                        var ut = long.Parse(utime);
-                                        /*
-                                        if (new DateTime(1970, 1, 1, 0, 0, 0).AddSeconds(ut).Year == 2015)
-                                        {
-
-                                        }*/
-                                        if (mindate == null || mindate.Value > ut)
-                                            mindate = ut;
-                                    }
-                                }
+                                var ut = GetRootArticleDate(article);
+                                if (ut != null) dates.Add(ut.Value);
                             }
                         }
 
 
                         var zz = x.DescendantsAndSelf().Select(y =>
                         {
-                            MaybeSetMainProgress(y);
-
+                            //MaybeSetMainProgress(y);
+                            if (y.GetAttributeValue("data-ftr") != null)
+                            {
+                                var ut = GetRootArticleDate(y);
+                                if (ut != null) dates.Add(ut.Value);
+                            }
+                            /*
                             var ajaxify = y.GetAttributeValue("ajaxify");
                             if (ajaxify != null && ajaxify.StartsWith("/pages_reaction_units/"))
                             {
@@ -226,9 +226,10 @@ namespace Shaman.Scraping
                                 var u = new Uri("https://www.facebook.com" + ajaxify);
                                 return (Url: u, false);
                             }
+                            */
 
                             var z = y.TryGetLinkUrl();
-                            if (z != null)
+                            if (z != null && !z.Contains("pages_reaction_unit"))
                             {
                                 return (Url: z, y.TagName.In("img", "script") || y.GetAttributeValue("rel")?.ToLowerFast() == "stylesheet");
                             }
@@ -243,14 +244,45 @@ namespace Shaman.Scraping
 
                         return zz;
                     }).ToList();
-
-
+                    var mindate = dates.Count == 0 ? (long?)null : dates.Count == 1 ? dates[0] : dates.Skip(1).Min();
                     if (mindate != null)
                     {
-                        var pageletToken = html.Select(x => x.TryGetValue("script:json-token('£jscc_map'):json-token('£pagelet_token')")).FirstOrDefault(x => x != null);
-                        if (pageletToken != null)
-                            AddFacebookProfileSegment(mindate.Value - 1, fbNumericId, pageletToken);
+                        SetMainProgressStatus(new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(mindate.Value).ToString("MMM d, yyyy H:mm"));
                     }
+
+                    var mustStop = mindate != null && IsBeforeLimitDate(mindate.Value);
+                    if (fburl.Contains("/profile"))
+                    {
+                        if (!mustStop && mindate != null)
+                        {
+                            var pageletToken = html.Select(x => x.TryGetValue("script:json-token('£jscc_map'):json-token('£pagelet_token')")).FirstOrDefault(x => x != null);
+                            if (pageletToken != null)
+                                AddFacebookProfileSegment(mindate.Value - 1, fbNumericId, pageletToken);
+                        }
+                    }
+                    else
+                    {
+                        if (mustStop) Stop = true;
+                    }
+
+
+                    /*
+                    if (UpdateUpTo != null)
+                    {
+                        var qq = zzz.Where(x => x.Url.Contains("pages_reaction_unit")).Distinct().ToList();
+                        if (qq.Count >= 2)
+                        {
+
+                        }
+                        var u = zzz.FindIndex(x=>x.Url.Contains("pages_reaction_unit"));
+                        if (u != -1)
+                        {
+                            var m = new LazyUri(zzz[u].Url);
+                            m.AppendQueryParameter("x-refresh", refreshId);
+                            zzz[u] = (m.Url, zzz[u].Item2);
+                        }
+                    }
+                    */
                     return zzz;
                 };
 
@@ -301,7 +333,7 @@ namespace Shaman.Scraping
 
                     if (DownloadComments || DownloadFullSizeImages)
                     {
-                        if (IsSubfolderOf(url, root))
+                        if (UrlRuleMatcher.IsSubfolderOf(url, root))
                         {
                             if (url.HasNoQueryParameters() && string.IsNullOrEmpty(url.Fragment)) return true;
                             AddToCrawl(url.GetLeftPart(UriPartial.Path));
@@ -313,6 +345,34 @@ namespace Shaman.Scraping
                 };
                 this.AddToCrawl(root);
             }
+            this.Root = root;
+        }
+        
+        private long? GetRootArticleDate(HtmlNode article)
+        {
+            var abbr = article.FindSingle("abbr");
+            if (abbr != null && abbr.Ancestors().Last(y => y.GetAttributeValue("data-ftr") != null) == article)
+            {
+                var utime = abbr.GetAttributeValue("data-utime");
+                if (utime != null)
+                {
+                    if (abbr.Ancestors().Any(x => (x.Id?.Contains("pinned") == true))) return null;
+                    var ut = long.Parse(utime);
+
+                    return ut;
+                }
+            }
+            return null;
+        }
+
+        internal Uri Root;
+
+        private bool IsBeforeLimitDate(long value)
+        {
+            if (UpdateUpTo == null) return false;
+            var r = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(value);
+            return r < UpdateUpTo.Value;
+
         }
 
         private void InitGroup()
@@ -320,7 +380,7 @@ namespace Shaman.Scraping
             var initialUrl = ReadFromExample("fbgroup");
             initialUrl.AppendFragmentParameter("$json-query-data.group_id~", fbNumericId);
 
-            AddComplexAjax(initialUrl.Url, "§£json-query-data.end_cursor={script:json-token('£jscc_map'):json-token('£end_cursor')}");
+            AddComplexAjax(initialUrl.Url, "§£json-query-data.end_cursor={script:json-token('£jscc_map'):last:json-token('£end_cursor')}");
         }
 
         private HtmlNode RehydrateHtml(HtmlNode page)
@@ -355,10 +415,12 @@ namespace Shaman.Scraping
 
         private void ProcessPageReactionUnitsRequest(Uri url, Stream body)
         {
+            if (Stop) return;
             using (var responseText = new StreamReader(body, Encoding.UTF8))
             {
                 var t = responseText.ReadToEnd();
                 var els = GetHtmlPiecesFromJson(t, url);
+                var aja = new List<string>();
                 foreach (var q in els)
                 {
                     foreach (var item in q.FindAll("[ajaxify]"))
@@ -366,13 +428,15 @@ namespace Shaman.Scraping
                         var ajaxify = item.GetAttributeValue("ajaxify");
                         if (ajaxify.StartsWith("/pages_reaction_units"))
                         {
-                            AddToCrawl("https://www.facebook.com" + ajaxify + "&__a=1");
+                            var m = "https://www.facebook.com" + ajaxify + "&__a=1";
+                            aja.Add(m);
+                            AddToCrawl(m);
                         }
                     }
                     CrawlLinks(q);
                     
                 }
-
+ 
             }
         }
 
@@ -383,8 +447,12 @@ namespace Shaman.Scraping
             {
                 text = @"
 https://www.facebook.com/ajax/pagelet/generic.php/GroupEntstreamPagelet?
+__a=1&
 ajaxpipe=1#
 $json-query-data.group_id~=xxxxx&
+$json-query-data.last_view_time~=0&
+$json-query-data.is_first_story_seen~=true&
+$json-query-data.sorting_setting=CHRONOLOGICAL&
 $json-query-data.multi_permalinks~=--
 ";
             }
@@ -407,7 +475,8 @@ __a=1&
 ajaxpipe=1#
 $json-query-data.start~=0&
 $json-query-data.query_type~=8&
-$json-query-data.page_index~=10
+$json-query-data.page_index~=10&
+$json-query-data.sorting_setting=CHRONOLOGICAL
 ";
             }
             else
@@ -431,6 +500,11 @@ $json-query-data.page_index~=10
         [Configuration]
         private static string Configuration_PageReactionUnitsSelector = @"__html:reparse-html";
         public bool ScrapeMobileVersion;
+
+
+        public DateTime? UpdateUpTo;
+        private string refreshId;
+
         private string fburl { get => SerializedProperties.TryGetValue("fburl"); set => SerializedProperties["fburl"] = value; }
         private string fbNumericId { get => SerializedProperties.TryGetValue("fbNumericId"); set => SerializedProperties["fbNumericId"] = value; }
 

@@ -10,6 +10,9 @@ using System.Text.RegularExpressions;
 using System.Net.Http;
 using Newtonsoft.Json;
 using System.Reflection;
+using System.Diagnostics;
+using System.Text.Utf8;
+using System.Globalization;
 #if DOM_EMULATION
 using Shaman.DomEmulation;
 #endif
@@ -19,7 +22,7 @@ namespace Shaman.Scraping
 {
     public class Program
     {
-        public static void Main()
+        public static int Main()
         {
             ConfigurationManager.Initialize(typeof(Program).GetTypeInfo().Assembly, IsDebug);
             ConfigurationManager.Initialize(typeof(HttpUtils).GetTypeInfo().Assembly, IsDebug);
@@ -29,10 +32,17 @@ namespace Shaman.Scraping
             {
                 Shaman.Runtime.SingleThreadSynchronizationContext.Run(MainAsync);
             }
+            catch(Exception ex)
+            {
+                var z = ex.RecursiveEnumeration(x => x.InnerException).Last();
+                Console.WriteLine(z);
+                return 1;
+            }
             finally
             {
                 BlobStore.CloseAllForShutdown();
             }
+            return 0;
         }
 
 
@@ -47,6 +57,9 @@ namespace Shaman.Scraping
 
         [Configuration(CommandLineAlias = "facebook-make-csv")]
         public static bool Configuration_FacebookMakeCsv;
+        [Configuration(CommandLineAlias = "facebook-update")]
+        public static bool Configuration_FacebookUpdate;
+
 
 
         [Configuration(CommandLineAlias = "cookies")]
@@ -55,6 +68,23 @@ namespace Shaman.Scraping
         [Configuration(CommandLineAlias = "cookie-file")]
         public static string Configuration_CookieFile;
 
+        [Configuration(CommandLineAlias = "site-rules")]
+        public static string[] Configuration_SiteRules;
+
+        [Configuration(CommandLineAlias = "site-url")]
+        public static string Configuration_SiteUrl;
+
+        [Configuration(CommandLineAlias = "retry-failed")]
+        public static bool Configuration_RetryFailed;
+
+        [Configuration(CommandLineAlias = "destination")]
+        public static string Configuration_Destination;
+
+        [Configuration(CommandLineAlias = "trim-broken-warcs")]
+        public static bool Configuration_TrimBrokenWarcs;
+
+        [Configuration(CommandLineAlias = "reconsider-all")]
+        public static bool Configuration_ReconsiderAll;
 
         public static async Task MainAsync()
         {
@@ -81,18 +111,26 @@ namespace Shaman.Scraping
             var dynamicParameters = new Dictionary<string, MemberInfo>();
             foreach (var item in allDynamicParameters)
             {
-                var name = "--" + Dasherize(item.DeclaringType.Name.TrimEnd("Scraper")) + "-" + Dasherize(item.Name);
+                var name = "--" + Dasherize((item.DeclaringType == typeof(WebsiteScraper) ? "Site" : item.DeclaringType.Name.TrimEnd("Scraper"))) + "-" + Dasherize(item.Name);
                 dynamicParameters.Add(name, item);
             }
             //File.WriteAllLines(@"c:\temp\-scraping-extra-parameters.txt", dynamicParameters.Keys.OrderBy(x => x), Encoding.UTF8);
 
             var positional = Environment.GetCommandLineArgs();
 
-
-
             //Caching.EnableWebCache("/Awdee/Cache/DomEmulation");
 
             WebsiteScraper commandLineScraper = null;
+
+            if (Configuration_SiteUrl != null)
+            {
+                commandLineScraper = new WebsiteScraper();
+                Program.InitScraperDefaults(commandLineScraper);
+                if (Configuration_SiteRules != null)
+                    commandLineScraper.Rules = Configuration_SiteRules;
+                commandLineScraper.Cookies = cookies;
+
+            }
 
             for (var i = 0; i < positional.Length; i++)
             {
@@ -127,6 +165,7 @@ namespace Shaman.Scraping
                     {
                         if (!hasValue) throw new Exception("Missing value for parameter " + positional[i]);
                         if (mt == typeof(string)) v = val;
+                        else if (mt == typeof(string[])) v = val.SplitFast(',', StringSplitOptions.RemoveEmptyEntries);
                         else if (mt == typeof(double) || mt == typeof(float))
                         {
                             v = Convert.ChangeType(double.Parse(val), mt);
@@ -145,8 +184,88 @@ namespace Shaman.Scraping
 
             if (commandLineScraper != null)
             {
+
                 using (commandLineScraper)
                 {
+                    //commandLineScraper.DatabaseSaveInterval = TimeSpan.FromMinutes(10);
+                    if (Configuration_Destination != null)
+                    {
+                        if (Configuration_Destination.Contains("/") || Configuration_Destination.Contains("\\"))
+                        {
+                            commandLineScraper.DestinationDirectory = Path.GetFullPath(Configuration_Destination);
+                        }
+                        else
+                        {
+                            commandLineScraper.DestinationSuggestedName = Configuration_Destination;
+                        }
+                    }
+                    if (Configuration_SiteUrl != null)
+                        commandLineScraper.AddToCrawl(Configuration_SiteUrl.AsUri());
+                    commandLineScraper.PerformInitialization();
+                    if (commandLineScraper is FacebookScraper)
+                    {
+                        var postsCsv = Path.Combine(commandLineScraper.DestinationDirectory, "Posts.csv");
+
+                        if (
+                            !Configuration_RetryFailed &&
+                            !Configuration_ReconsiderAll &&
+                            !Configuration_FacebookUpdate &&
+                            File.Exists(postsCsv)) return;
+
+                        if (Configuration_FacebookUpdate)
+                        {
+                            var candidates = WarcItem.ReadIndex(Path.Combine(commandLineScraper.DestinationDirectory, "index.cdx"));
+                            /*string user = null;
+                            first.OpenStream((key, value) => {
+                                if (key == "Cookie") user = value.TryCaptureBetween((Utf8String)"c_user=", (Utf8String)";")?.ToString();
+                            }).Dispose();*/
+                            // the id might also be in the redirected page
+                            var user = candidates.Take(2).Select(x => x.ReadText().TryCaptureBetween("USER_ID\":\"", "\"")).FirstOrDefault(x => x != null);
+                            string filename =
+                                user == "-----" ? "------.txt" :
+                                user == null || user == "0" ? (string)null :
+                                throw new ArgumentException("Unknown facebook user: " + user);
+                            var stopAt = DateTime.ParseExact(File.ReadAllLines(postsCsv)[1].CaptureBefore(","), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+                            var fb = (FacebookScraper)commandLineScraper;
+                            fb.UpdateUpTo = stopAt;
+                            if (File.Exists(Path.Combine(commandLineScraper.DestinationDirectory, "fbgroup-not-a-member"))) return;
+                            if (File.Exists(Path.Combine(commandLineScraper.DestinationDirectory, "fberror"))) return;
+                            fb.SetStatus(fb.Root, UrlStatus.ToCrawl);
+
+                            if (long.TryParse(fb.Page, out var id))
+                            {
+                                var url = "https://www.facebook.com/profile.php?id=" + id;
+                                if (fb.GetStatus(url) != UrlStatus.UnknownUrl)
+                                    fb.SetStatus(url.AsUri(), UrlStatus.ToCrawl);
+                            }
+                            
+                            if (filename != null)
+                            {
+                                filename = Path.Combine(@"C:\Users\Andrea\OneDrive\QwawaDesktop\Scraping", filename);
+                                commandLineScraper.Cookies = File.ReadAllText(filename).Trim().TrimStart("Cookie:").Trim();
+                            }
+
+                        }
+                    }
+
+
+                    if (Configuration_ReconsiderAll)
+                        commandLineScraper.ReconsiderForScraping("**");
+                    else
+                        commandLineScraper.ReconsiderSkippedUrls();
+
+                    if (Configuration_RetryFailed)
+                        commandLineScraper.ReconsiderFailedUrls();
+
+                    /*
+                    foreach (var line in File.ReadAllLines(@"C:\Users\Andrea\Desktop\arcilesbica-robots.txt"))
+                    {
+                        var l = line.Trim();
+                        if (l.Length == 0) continue;
+                        commandLineScraper.AddToCrawl("http://www.arcilesbica.it"+l);
+                    }
+                    */
+
                     if (!Configuration_FacebookMakeCsv)
                         await commandLineScraper.ScrapeAsync();
                     if (commandLineScraper is FacebookScraper f)
@@ -168,34 +287,136 @@ namespace Shaman.Scraping
             
             using (var scraper = new WebsiteScraper())
             {
-                InitScraperDefaults(scraper);/*
-                scraper.Parallelism = 3;
-                scraper.AddToCrawl("http://www.azlyrics.com/");
+                InitScraperDefaults(scraper);
+
+
+                /*
+                scraper.DestinationSuggestedName = "fb-anisea-friends";
+                scraper.Cookies = File.ReadAllText(@"C:\Repositories\Awdee\Awdee2.Declarative\phantomjs\facebookcookiesanisea.txt").Trim();
                 scraper.ShouldScrape = (url, prereq) =>
                 {
-                    return url.Host == "www.azlyrics.com" && url.HasNoQueryParameters();
+                    if (prereq) return true;
+                    return false;
                 };
+                scraper.ForceLinks = "a:link-has-host-path('m.facebook.com'; '/friends/center/friends/')";
+                scraper.AddToCrawl("https://m.facebook.com/friends/center/friends/", true);
                 */
-                scraper.DestinationSuggestedName = "site-outducks.org";
-                scraper.AddToCrawl("https://outducks.org/"); 
-                using (var s = new CsvReader(@"C:\Users\Andrea\Downloads\isv\inducks_entryurl.isv"))
-                {
-                    s.Separator = (byte)'^';
-                    s.ReadHeader();
-                    while (true)
+                /*
+                var friends = scraper.CdxIndex.Values.Where(x => x.Url.Contains("/friends/center/friends/"))
+                    .SelectMany(x => 
                     {
-                        var line = s.ReadLine();
-                        if (line == null) break;
-                        if (line.Length == 0) continue;
-                        var sitecode = line[1].ToStringCached();
-                        var path = line[3];
-                        if (sitecode == "webusers") sitecode = "webusers/webusers";
-                        scraper.AddToCrawl("https://outducks.org/" + sitecode + "/" + path);
+                        var zz = x.ReadHtml();
+                        return zz.FindAll("div.w.bk").Select(z=> {
+                            var m = z.TryGetValue("div.bn.bo", pattern: @"^([,\d]+) mutual");
+                            return new FacebookFriend
+                            {
+                                Name = z.TryGetValue("img", "alt"),
+                                MutualFriends = m != null ? int.Parse(m.Replace(",", string.Empty)) : -1,
+                                Id = long.Parse(z.GetLinkUrl("a").GetQueryParameter("uid"))
+                            };
+                        });
+                    }).ToList();
+                JsonFile.Save(friends, Path.Combine(scraper.DestinationDirectory, "friends.json"));
+                */
+                /*
+                var friends = JsonFile.Read<List<FacebookFriend>>(Path.Combine(scraper.DestinationDirectory, "friends.json"))
+                    .OrderByDescending(x => x.MutualFriends);
+                    */
+                //friends.OpenExcel();
+                /*
+                await friends.ForEachThrottledAsync(async x =>
+                {
+                Console.WriteLine(x.Name);
+                var p = await scraper.GetHtmlNodeAsync(("https://m.facebook.com/" + x.Id).AsUri());
+                }, Debugger.IsAttached ? 1 : scraper.Parallelism);
+                */
+                /*
+                foreach (var item in scraper.CdxIndex.Values.Where(x=>x.Url.EndsWith("_rdr")))
+                {
+                    Console.WriteLine(item.Url);
+                    scraper.CrawlLinks(item.ReadHtml());
+                }
+                scraper.SaveDatabase();
+                await scraper.ScrapeAsync();
+                */
+
+                /*
+                var actuallyExisting = new HashSet<string>(scraper.CdxIndex.Keys);
+                
+                foreach (var item in scraper.GetScrapedUrls(false))
+                {
+                    if (!actuallyExisting.Contains(item.AbsoluteUri))
+                    {
+                        scraper.SetStatus(item, UrlStatus.ToCrawl);
                     }
                 }
-               
+                return;*/
+                
+                var resourcesOnly = true;
+                scraper.AddToCrawl("http://knowyourmeme.com/");
+                if (!resourcesOnly)
+                {
+                    scraper.Parallelism = 2;
+                    scraper.InterRequestDelay = TimeSpan.FromSeconds(0.4);
+                }
+                scraper.HtmlReceived += (a, b, page) =>
+                {
+                    if (page.FindSingle("h3:contains('include your ip address then there')") != null)
+                    {
+                        scraper.Dispose();
+                        throw new Exception("IP banned.");
+                    }
+                };
+                scraper.RewriteLink = (url) =>
+                {
+                    if (url.Query == "?fb") return url.GetLeftPart(UriPartial.Path).AsUri();
+                    return url;
+                };
+                scraper.ShouldScrape = (url, prereq) =>
+                {
+                    if (url.Contains("kym") && url.EndsWith(".jpg"))
+                    {
 
-               // scraper.ReconsiderSkippedUrls();
+                    }
+                    if (resourcesOnly && url.IsHostedOn("knowyourmeme.com")) return false;
+                    if (!resourcesOnly && !url.IsHostedOn("knowyourmeme.com")) return false;
+
+                    //if (url.IsHostedOn("kym-cdn.com")) return false; // todo
+                    if (url.IsHostedOn("imgur.com")) return false; // todo
+
+                    if (url.IsHostedOn("meme.am")) return false;
+                    //if (!url.IsHostedOn("kym-cdn.com")) return false;
+                    if (prereq) return true;
+                    if (!scraper.IsSubfolderOfFirstUrl(url)) return false;
+                    if (url.HasQueryParameters()) return false;
+                    if (url.AbsolutePath == "/") return true;
+                    if (url.PathEndsWith("/photos/page/1")) return false;
+                    if (url.PathEndsWith("/videos/page/1")) return false;
+                    if (url.PathEndsWith("/editorships")) return false;
+                    if (url.PathEndsWith("/ask")) return false;
+                    if (url.PathContainsComponent("/photos/trending")) return false;
+                    if (url.PathContainsComponent("/videos/trending")) return false;
+                    //if (url.PathStartsWith("/page/")) return true;
+                    if (url.PathContainsComponent("/memes/popular/")) return false;
+                    if (url.PathContainsComponent("/deadpool/")) return false;
+                    if (url.PathContainsComponent("/memes/researching/page/")) return false;
+                    
+                    if (url.PathContainsComponent("/edits/")) return false;
+                    if (url.PathContainsComponent("/sort/")) return false;
+                    if (url.PathContainsComponent("/favorites/")) return false;
+                    if (url.PathContainsComponent("/new/")) return false;
+                    if (url.PathStartsWith("/memes/")) return true;
+                    
+                    //if (url.PathContains("/photos/")) return false;
+                    
+                    //if (url.PathEndsWith("/children")) return false;
+                    return false;
+                };
+
+                scraper.ReconsiderForScraping("**");
+                
+                //await scraper.ScrapeFailedImagesFromKnownHostsAsync();
+                
                 await scraper.ScrapeAsync();
             }
 #else
@@ -203,6 +424,14 @@ namespace Shaman.Scraping
 #endif
 
         }
+
+        public class FacebookFriend
+        {
+            public string Name;
+            public long Id;
+            public int MutualFriends;
+        }
+
 
         private static string Dasherize(string v)
         {

@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <VersionPrefix>1.0.1.4</VersionPrefix>
-    <TargetFrameworks>netstandard1.5;net46</TargetFrameworks>
+    <TargetFrameworks>netstandard2.0;net46</TargetFrameworks>
     <AssemblyOriginatorKeyFile>ShamanOpenSourceKey.snk</AssemblyOriginatorKeyFile>
     <SignAssembly>true</SignAssembly>
     <PublicSign Condition=" '$(OS)' != 'Windows_NT' ">true</PublicSign>
@@ -28,12 +28,12 @@
     <PackageReference Include="Shaman.Streams.Utf8" Version="1.0.0.16" />
     <PackageReference Include="Shaman.SingleThreadSynchronizationContext" Version="1.0.0.8" />
     <PackageReference Include="System.ValueTuple" Version="4.3.0" />
-    <PackageReference Include="Shaman.Http" Version="1.0.1.8" />
+    <PackageReference Include="Shaman.Http" Version="1.0.1.10" />
   </ItemGroup>
   <ItemGroup Condition=" '$(TargetFramework)' == 'net46' ">
     <PackageReference Include="Shaman.Console" Version="1.0.0.10" />
   </ItemGroup>
-  <PropertyGroup Condition=" '$(TargetFramework)' == 'netstandard1.5' ">
+  <PropertyGroup Condition=" '$(TargetFramework)' == 'netstandard2.0' ">
     <DefineConstants>$(DefineConstants);CORECLR</DefineConstants>
   </PropertyGroup>
 </Project>

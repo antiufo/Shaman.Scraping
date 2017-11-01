@@ -38,12 +38,20 @@ namespace Shaman.Scraping
     {
 
         public bool DownloadCssExternalImages = true;
-
+        private bool initializing;
         public void PerformInitialization()
         {
-            if (!initialized)
+            if (!initialized && !initializing)
             {
-                Initialize();
+                initializing = true;
+                try
+                {
+                    Initialize();
+                }
+                finally
+                { 
+                    initializing = false;
+                }
                 initialized = true;
             }
         }
@@ -52,8 +60,7 @@ namespace Shaman.Scraping
         {
         }
 
-        [Configuration(CommandLineAlias = "debug-scraper-rules")]
-        static bool Configuration_DebugRules;
+
 
         public bool OutputAsWarc;
 #if WARC
@@ -82,6 +89,8 @@ namespace Shaman.Scraping
             }
         }
 
+        protected bool Stop { get; set; }
+
         internal void AddComplexAjax(Uri initialRequest, string nextPageLinkSelector)
         {
             AddToCrawl(initialRequest);
@@ -90,6 +99,7 @@ namespace Shaman.Scraping
                 addedNextPageLinkSelectorExtractors.Add(nextPageLinkSelector);
                 CollectAdditionalLinks += (url, node) =>
                 {
+                    if (Stop) return null;
                     var lazy = new LazyUri(url);
                     NextPageLinkSelection.UpdateNextLink(ref lazy, node, nextPageLinkSelector, alwaysPreserveRemainingParameters: true);
                     if (lazy != null) return new[] { (lazy.Url, false) };
@@ -531,38 +541,12 @@ namespace Shaman.Scraping
 
         public bool IsSubfolderOfFirstUrl(Uri url, bool ignoreLastComponentOfInitialUrl = false)
         {
-            return IsSubfolderOf(url, _firstAddedUrl, ignoreLastComponentOfInitialUrl);
+            return UrlRuleMatcher.IsSubfolderOf(url, _firstAddedUrl, ignoreLastComponentOfInitialUrl);
         }
 
-        public bool IsSubfolderOf(Uri url, Uri folder)
-        {
-            return IsSubfolderOf(url, folder, false);
-        }
 
-        public bool IsSubfolderOf(Uri url, Uri folder, bool ignoreLastComponentOfInitialUrl)
-        {
-            if (url.Scheme != folder.Scheme) return false;
-            if (url.Host != folder.Host) return false;
-            if (url.Port != folder.Port) return false;
-            var path1 = folder.AbsolutePath;
-            var path2 = url.AbsolutePath;
 
-            if (ignoreLastComponentOfInitialUrl)
-            {
-                var p = path1.LastIndexOf('/');
-                if (p > 0)
-                {
-                    path1 = path1.Substring(0, p);
-                }
-            }
-
-            if (path2.Length < path1.Length) return false;
-            if (!path2.StartsWith(path1)) return false;
-
-            if (path1.Length > path2.Length && path2[path1.Length] != '/') return false;
-
-            return true;
-        }
+      
 
         public void ReconsiderFailedUrls()
         {
@@ -923,140 +907,7 @@ namespace Shaman.Scraping
                     };
                 }
 
-                var lastComponent = FirstAddedUrl.AbsolutePath.SplitFast('/').LastOrDefault();
-                var ignoreLastComponent = lastComponent != null && lastComponent.Contains('.');
-                var rules = Rules != null ? Rules.Select(x => x.Trim()).Where(x => x.Length != 0).Select(x =>
-                {
-                    var kind = x[0];
-                    var include =
-                        kind == '+' ? true :
-                        kind == '-' ? false :
-                        throw new ArgumentException();
-                    var rest = x.Substring(1);
-                    bool? prereqOnly = null;
-                    if (rest.StartsWith("prereq:"))
-                    {
-                        rest = rest.CaptureAfter(":");
-                        prereqOnly = true;
-                    }
-                    else if (rest.StartsWith("noprereq:"))
-                    {
-                        rest = rest.CaptureAfter(":");
-                        prereqOnly = false;
-                    }
-                    if (prereqOnly != null && prereqOnly.Value != include)
-                        throw new ArgumentException("+prereq: or -noprereq: rules must be used when prerequisite condition is specified.");
-
-                    var scheme =
-                                rest == "**" ? null :
-                                rest.StartsWith("http:") ? "http" :
-                                rest.StartsWith("https:") ? "https" :
-                                rest.StartsWith("//") ? null :
-                                _firstAddedUrl.Scheme;
-
-                    var hasHost = rest.StartsWith("//") || rest.StartsWith("http:") || rest.StartsWith("https:");
-                    string hostedOn = null;
-                    string host = null;
-                    if (!hasHost && rest.Length > 0 && char.IsLetterOrDigit(rest[0]))
-                    {
-                        hostedOn = rest.TryCaptureBefore("/") ?? rest;
-                        if (!hostedOn.Contains(".")) throw new ArgumentException();
-                        rest = rest.Substring(hostedOn.Length);
-                        if (string.IsNullOrEmpty(rest)) rest = "/**";
-                        scheme = null;
-                    }
-                    else
-                    {
-                        host = rest == "**" ? null : hasHost ?
-                            rest.TryCaptureBetween("//", "/") ?? rest.CaptureAfter("//") :
-                            _firstAddedUrl.Host;
-                    }
-                    var query = rest.TryCaptureAfter("?");
-                    var mustHaveQuery =
-                        query == string.Empty ? false :
-                        query == null ? (bool?)null :
-                        true;
-                    var canHaveExtraQueryParameters = query == null || query.Contains("*");
-                    var queryParameters = query != "**" && !string.IsNullOrEmpty(query) ? (query.StartsWith("*") ? query.Substring(1) : query).SplitFast('&') : null;
-                    if (queryParameters != null && queryParameters.Any(y => y.Contains('*'))) throw new ArgumentException();
-                    var queryParametersMandatoryValues = queryParameters != null ? new string[queryParameters.Length] : null;
-                    if (queryParameters != null)
-                    {
-                        for (int i = 0; i < queryParameters.Length; i++)
-                        {
-                            if (queryParameters[i].IndexOf('=') != -1)
-                            {
-                                var val = queryParameters[i].CaptureAfter("=");
-                                queryParameters[i] = queryParameters[i].CaptureBefore("=");
-                                queryParametersMandatoryValues[i] = val;
-                                if (canHaveExtraQueryParameters) throw new Exception("Constrained parameter values are not supported when canHaveExtraQueryParameters.");
-                            }
-                        }
-                    }
-                    var path = (hasHost ? "/" + rest.CaptureAfter("//").CaptureAfter("/") : rest);
-                    if (!path.StartsWith("/") && !path.StartsWith("*")) throw new ArgumentException();
-                    path = path.TryCaptureBefore("?") ?? path;
-                    var hasEndAnchor = path.EndsWith("$");
-                    if (hasEndAnchor) path = path.Substring(0, path.Length - 1);
-                    var a = path.Replace("**", "__starstar__").Replace("*", "__star__");
-                    var pathRegex = new Regex(("^" + Regex.Escape(a) + (hasEndAnchor ? "$" : "(/.*|)$"))
-                        .Replace("__starstar__", @".*")
-                        .Replace("__star__", @"[^/\?&]+"));
-
-                    return new Func<Uri, bool, bool?>((url, prereq) =>
-                    {
-                        if (prereqOnly == true && !prereq) return null;
-                        if (prereqOnly == false && prereq) return null;
-                        //Console.WriteLine("Rule: " + x);
-                        if (scheme != null && url.Scheme != scheme) return null;
-                        if (hostedOn != null && !url.IsHostedOn(hostedOn)) return null;
-                        if (host != null && url.Host != host) return null;
-                        if (query == "**" && !url.HasQueryParameters()) return null;
-                        if (!pathRegex.IsMatch(url.AbsolutePath)) return null;
-                        if (queryParameters != null)
-                        {
-                            if (canHaveExtraQueryParameters)
-                            {
-                                var t = url.GetQueryParameters().Select(z => z.Key).ToList();
-                                if (queryParameters.Any(z => !t.Contains(z))) return null;
-                            }
-                            else
-                            {
-                                var n = 0;
-                                foreach (var item in url.GetQueryParameters())
-                                {
-                                    if (n >= queryParameters.Length) return null;
-                                    if (queryParameters[n] != item.Key) return null;
-                                    if (queryParametersMandatoryValues[n] != null && queryParametersMandatoryValues[n] != item.Value) return null;
-                                    n++;
-                                }
-                                if (n != queryParameters.Length) return null;
-                            }
-                        }
-                        else
-                        {
-                            if (!canHaveExtraQueryParameters & url.HasQueryParameters()) return null;
-                        }
-                        if (Configuration_DebugRules)
-                            Console.WriteLine(url.AbsoluteUri + " -> " + (include ? "YES" : "NO") + ": rule " + x);
-                        return include;
-                    });
-                }).ToList() : null;
-                ShouldScrape = (url, prereq) =>
-                {
-                    if (rules != null)
-                    {
-                        foreach (var rule in rules)
-                        {
-                            var z = rule(url, prereq);
-                            if (z != null) return z;
-                        }
-                    }
-                    if (IsSubfolderOfFirstUrl(url, ignoreLastComponent)) return true;
-                    if (prereq) return null;
-
-                    return false;
-                };
+                ShouldScrape = UrlRuleMatcher.GetMatcher(Rules, _firstAddedUrl, false);
                 //throw new ArgumentException("ShouldScrape was not configured.");
             }
         }
@@ -2052,6 +1903,8 @@ namespace Shaman.Scraping
         }
 
         private FileStream lockFile;
+        [Configuration(CommandLineAlias = "ignore-ssl")]
+        private static bool Configuration_IgnoreSsl;
 #if WARC
         private void AppendNewItemsToIndex()
         {
@@ -2124,9 +1977,19 @@ namespace Shaman.Scraping
 
 #if WARC
 
+        [Configuration]
+        public static readonly string Configuration_ProxyHost;// = "localhost";
+        [Configuration]
+        public static readonly int Configuration_ProxyPort = 8888;
+
 
         internal static async Task<(HttpStatusCode, CurlCode, WarcItem)> ScrapeAsync(CurlEasy easy, HttpRequestMessage requestMessage, string url, MemoryStream requestMs, MemoryStream responseMs, Func<CurlEasy, WarcWriter> getWriter, object syncObj, CancellationToken ct)
         {
+            if (Configuration_ProxyHost != null)
+            { 
+                easy.Proxy = Configuration_ProxyHost;
+                easy.ProxyPort = Configuration_ProxyPort;
+            }
             requestMs.SetLength(0);
             responseMs.SetLength(0);
             var startDate = DateTime.UtcNow;
@@ -2136,7 +1999,7 @@ namespace Shaman.Scraping
             if (hash != -1)
                 url = url.Substring(0, hash);
 
-            easy.UserAgent = "Mozilla/5.0 (Windows NT 10.0; WOW64; rv:52.0) Gecko/20100101 Firefox/52.0";
+            easy.UserAgent = WebRequestOptions.DefaultOptions.UserAgent;
             easy.Url = url;
 
             easy.HeaderFunction = (byte[] buf, int size, int nmemb, Object extraData) =>
@@ -2166,15 +2029,21 @@ namespace Shaman.Scraping
             };
             easy.SslContextFunction = OnSslContext;
             easy.Verbose = true;
-            
-            
-            easy.CaInfo = ConfigurationManager.CombineRepositoryOrEntrypointPath("Shaman.Scraping/curl-ca-bundle.crt");
-            /*
-            easy.CaPath = null;
-            easy.SslVerifyhost = false;
-            easy.SslVerifyPeer = false;
-            */
 
+            if (Configuration_IgnoreSsl)
+            {
+                easy.CaPath = null;
+                easy.SslVerifyhost = false;
+                easy.SslVerifyPeer = false;
+
+            }
+            else
+            {
+
+                easy.CaInfo = ConfigurationManager.CombineRepositoryOrEntrypointPath("Shaman.Scraping/curl-ca-bundle.crt");
+            }
+
+    
             easy.WriteFunction = (byte[] buf, int size, int nmemb, Object extraData) =>
             {
                 if (ct.IsCancellationRequested) return 0;
